@@ -294,12 +294,26 @@ class PackedCausalAttambaGenerator:
         # Prefilling is done by taking multiple packed sequences and
         # doing block diagonal attention on them so they remain independent
         self.setup_prefilling(lengths=lengths)
+        # Disable the prefill block-masking
         prefill_out = self.model.forward(
             tokens,
             tok_idx=self.prefill_tok_id,
             mask=self.prefill_mask,
             attn_impl="flex_attention",
         )
+
+        # mask = self.prefill_mask
+        # dense_block = mask.to_dense() 
+        # block_size = mask.BLOCK_SIZE  
+        # full_shape = mask.shape
+        # full_dense_mask = dense_block.repeat_interleave(block_size[0], dim=2).repeat_interleave(block_size[1], dim=3)
+        # self.prefill_mask = full_dense_mask[:, :, :full_shape[2], :full_shape[3]]
+        # prefill_out = self.model.forward(
+        #     tokens,
+        #     tok_idx=self.prefill_tok_id,
+        #     mask=self.prefill_mask,
+        #     attn_impl="sdpa",
+        # )
         self.setup_generation(lengths=lengths)
         return prefill_out
 

@@ -364,7 +364,6 @@ class AttentiveSSM(nn.Module):
         head_dim = self.head_dim
         device = x.device
         K = self.token_chunk
-
         # Linear projecctions
         xq = self.wq(x.view_as(x))
         xk = self.wk(x.view_as(x))
@@ -428,13 +427,20 @@ class AttentiveSSM(nn.Module):
         mask_condition = ((k_abs < t_abs) & is_chunk_boundary.unsqueeze(0)) | (k_abs == (t_abs - 1))  # [L_q, L_k]
         attn_mask = mask_condition.unsqueeze(0).unsqueeze(0).expand(bsz, n_heads, -1, -1)  # [B, H, L_q, L_k]
         if mask != "causal":
-            import pdb; pdb.set_trace()
+            assert not isinstance(mask, AttentionBias), "We dont support fmha here."
+            # intersection of both masks, because it needs to be True
+            # in both cases, so that we attend to it.
+            # I do not understand this, during downstream-eval, what is mask trying to do?
+            # Support for downstream-eval might come later. 
+            dense_block = mask.to_dense() 
+            block_size = mask.BLOCK_SIZE  
+            full_shape = mask.shape
+            full_dense_mask = dense_block.repeat_interleave(block_size[0], dim=2).repeat_interleave(block_size[1], dim=3)
+            mask = full_dense_mask.expand(bsz, n_heads, -1, -1).bool()
+            Lq, Lk = attn_mask.size(2), attn_mask.size(3)
+            mask = mask[:, :, :Lq, :Lk]
+            attn_mask = mask & attn_mask
         
-        # Invert the mask: True indicates positions to be masked
-        # attn_mask = ~attn_mask  # [B, H, L_q, L_k]
-        # Handle different attention implementations
-        # if attn_impl == "sdpa":
-        # Perform scaled dot-product attention
         output = F.scaled_dot_product_attention(
             xq,        # [B, H_q, L_q, D]
             xk_processed,      # [B, H_q, L_k, D]

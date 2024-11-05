@@ -1,7 +1,7 @@
 # Template config, need to change dump_dir, data.root_dir and tokenizer.path
 
 dump_dir: "/scratch/ya255/lingua/debugdump/dbd_xmer"
-name: "debug"
+name: "dbd_xmer"
 #     Steps Tokens Covered
 # 2    1000      1 million
 # 3   10000     10 million
@@ -45,7 +45,8 @@ data:
     add_bos: true
     add_eos: true
     tokenizer:
-        name: bytes
+        name: tiktoken
+        path: setup/tokenizer/original/tokenizer.model
 
 profiling:
   run: true
@@ -56,29 +57,29 @@ profiling:
 
 checkpoint:
     dump:
-        every: 2500
+        every: 10000
         keep: 3
     eval:
-        every: 5000
+        every: 1000
         keep: -1
         
 logging:
     freq: 10
     wandb:
-        project: "attamba"   
-        name: "attamba_base_16" 
+        project: "attamba"
 
 eval:
     generator:
         max_tokens: 8192
         dtype: bf16
-        temperature: 1.0
-        top_p: 0.95
+        # temperature: 1.0
+        # top_p: 0.95
     harness:
         tasks:
-            - piqa
-            - arc_easy
-            - gsm8k
+            - wikitext
+            # - piqa
+            # - arc_easy
+            # - gsm8k
             # - wikitext
             # - task: nq_open
             #   num_fewshot: 5

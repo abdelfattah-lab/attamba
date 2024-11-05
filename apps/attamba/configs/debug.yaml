@@ -2,8 +2,8 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/debugdump/dbd_attamba_4_invalid"
-name: "debug_4"
+dump_dir: "/scratch/ya255/lingua/debugdump/dbd_attamba_4"
+name: "dbd_attamba_4"
 
 steps: 60_000
 probe_freq: null
@@ -25,20 +25,20 @@ distributed:
     tp_size: 1
 
 model:
-    dim: 256          # kvssm-dim separated, head_dim * n_heads should work now
+    dim: 1024          # kvssm-dim separated, head_dim * n_heads should work now
     token_chunk: 4
-    head_dim: 32
+    head_dim: 128
     n_layers: 8
     n_heads: 8
     
     # ssm params
-    kvssm_dim: 32      # Should be same as head-dim
-    state_dim: 64
-    ssm_chunk_size: 4  # Should be same as token_chunk
+    kvssm_dim: 128      # Should be same as head-dim
+    state_dim: 256
+    ssm_chunk_size: 32  # Should be same as token_chunk
     n_groups: 1
-    # ssm_hiddim: 256
-    ssm_hiddim: 32
-    learnable_init_states: true
+    ssm_hiddim: 256
+    # ssm_hiddim: 32
+    learnable_init_states: false
     ssm_heads: 8
     conv_size: 4
 
@@ -63,7 +63,8 @@ data:
     add_bos: true
     add_eos: true
     tokenizer:
-        name: bytes
+        name: tiktoken
+        path: setup/tokenizer/original/tokenizer.model
 
 profiling:
   run: true
@@ -74,29 +75,32 @@ profiling:
 
 checkpoint:
     dump:
-        every: 2500
+        every: 10000
         keep: 3
     eval:
-        every: 50
+        every: 1000
         keep: -1
 
 logging:
     freq: 10
-    # wandb:
-    #     project: "attamba"   
-    #     name: "transformer_base" 
+    wandb:
+        project: "attamba"   
 
 eval:
     generator:
-        max_tokens: 8192
-        # max_tokens: 1024
+        # max_tokens: 8192
+        max_tokens: 1024
         dtype: bf16
-        temperature: 1.0
-        top_p: 0.95
+        # temperature: 1.0
+        # top_p: 0.95
     harness:
         tasks:
-            - piqa
-            - arc_easy
-            - gsm8k
+            - wikitext
+            
+
+            # - piqa
+            # - arc_easy
+            # - gsm8k
+
             # - task: nq_open
             #   num_fewshot: 5
