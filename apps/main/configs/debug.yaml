@@ -45,8 +45,8 @@ data:
     add_bos: true
     add_eos: true
     tokenizer:
-        name: tiktoken
-        path: setup/tokenizer/original/tokenizer.model
+        name: sp
+        path: setup/l2tokenizer/tokenizer.model
 
 profiling:
   run: true

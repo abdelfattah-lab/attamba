@@ -182,7 +182,7 @@ def launch_eval(cfg: EvalArgs):
     generator = PackedCausalTransformerGenerator(cfg.generator, model, tokenizer)
 
     wrap = EvalHarnessLM(generator)
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     results = simple_evaluate(wrap, **asdict(cfg.harness))
     if get_global_rank() == 0:
         with open(Path(cfg.dump_dir) / "results.json", "w") as f:

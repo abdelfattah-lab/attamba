@@ -324,6 +324,7 @@ class AttentiveSSM(nn.Module):
         self.wk = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
 
     def process_chunks_with_ssm(self, x, ssm_module):
         bsz, seq_len, n_kv_heads, head_dim = x.shape
@@ -331,19 +332,17 @@ class AttentiveSSM(nn.Module):
         num_chunks = (seq_len + K - 1) // K
         pad_len = num_chunks * K - seq_len
         if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, pad_len))
+            x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
+
         x = x.view(bsz, num_chunks, K, n_kv_heads, head_dim)
 
-        # Reshape for SSM, merge batch and num_chunks
-        x = x.permute(0, 3, 1, 2, 4) # [B H NC K D]
-        bsz, n_kv_heads, num_chunks, K, head_dim = x.shape
-        x = x.reshape(bsz * n_kv_heads * num_chunks, K, head_dim)
+        bsz, num_chunks, K, n_kv_heads, head_dim = x.shape
+        x = x.reshape(bsz * num_chunks, K, n_kv_heads * head_dim).contiguous()
         if hasattr(ssm_module, "cache"):
             del ssm.cache   # State-less compressor
         ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
 
-        ssm_outputs = ssm_outputs.view(bsz, n_kv_heads, num_chunks, K, head_dim)
-        ssm_outputs = ssm_outputs.permute(0, 2, 3, 1, 4)
+        ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, n_kv_heads, head_dim)
 
         return ssm_outputs[:, :, :self.token_chunk, :, :]
 
@@ -371,50 +370,38 @@ class AttentiveSSM(nn.Module):
 
         output_shape = xq.shape
 
-        # Reshape to [B, S, H, D]
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
         xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
-
 
         # Apply rotary embedding for attention mechanism
         # TODO(akhauri@): rotary embedding should be reduced
         #                 per-chunk positional embedding implications...
         #                 would SSM capture this?
-        freq_cis_squeezed = freq_cis.squeeze(0)[:seq_len]
-        xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis_squeezed)
+        # xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis_squeezed)
 
+        # if hasattr(self, "kv_cache"):
+        #     xk, xv = self.kv_cache.update(xk, xv, tok_idx)
 
-        if hasattr(self, "kv_cache"):
-            xk, xv = self.kv_cache.update(xk, xv, tok_idx)
-
-        # Refresh seq_len with the actual length of the sequence for keys/values
-        seq_len_kv = xk.size(1)
-        L_k = seq_len_kv
-        # Process K-V embedding (state-less chunk)
         xk_ssm_outputs = self.process_chunks_with_ssm(xk, self.k_ssm) # B NC K H D
         xv_ssm_outputs = self.process_chunks_with_ssm(xv, self.v_ssm) # B NC K H D
-
-        # Flatten the SSM outputs to obtain per-position keys and values
-        # [B, N_c, K, H_kv, D] --> [B, N_c * K, H_kv, D]
         xk_processed = xk_ssm_outputs.reshape(bsz, -1, n_kv_heads, head_dim)  # [B, L_p, H_kv, D]
         xv_processed = xv_ssm_outputs.reshape(bsz, -1, n_kv_heads, head_dim)  # [B, L_p, H_kv, D]
+        xk_processed = xk_processed[:, :L_q, :, :]  # [B, L, H_kv, D]
+        xv_processed = xv_processed[:, :L_q, :, :]  # [B, L, H_kv, D]
 
-        # Trim to original sequence length in case of padding
-        xk_processed = xk_processed[:, :L_k, :, :]  # [B, L, H_kv, D]
-        xv_processed = xv_processed[:, :L_k, :, :]  # [B, L, H_kv, D]
+        freq_cis_squeezed = freq_cis.squeeze(0)[:seq_len]
+        # Here, should rotary embedding be re-indexed?
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis_squeezed)
 
-        # Repeat keys and values to match the number of query heads
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
         xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
         xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
 
-        # Transpose to [B, H_q, L, D]
-        xq = xq.transpose(1, 2)                   # [B, H_q, L, D]
-        xk_processed = xk_processed.transpose(1, 2)  # [B, H_q, L, D]
-        xv_processed = xv_processed.transpose(1, 2)  # [B, H_q, L, D]
-
-        # Construct the attention mask
-        # Identify chunk boundary positions
         chunk_boundaries = torch.arange(K - 1, L_k, K, device=device)  # Positions K-1, 2K-1, 3K-1, ...
         is_chunk_boundary = torch.zeros(L_k, dtype=torch.bool, device=device)
         is_chunk_boundary[chunk_boundaries] = True
@@ -425,12 +412,10 @@ class AttentiveSSM(nn.Module):
         k_abs = torch.arange(L_k, device=device).unsqueeze(0)  # [1, L_k]
 
         mask_condition = ((k_abs < t_abs) & is_chunk_boundary.unsqueeze(0)) | (k_abs == (t_abs - 1))  # [L_q, L_k]
+
         attn_mask = mask_condition.unsqueeze(0).unsqueeze(0).expand(bsz, n_heads, -1, -1)  # [B, H, L_q, L_k]
         if mask != "causal":
             assert not isinstance(mask, AttentionBias), "We dont support fmha here."
-            # intersection of both masks, because it needs to be True
-            # in both cases, so that we attend to it.
-            # I do not understand this, during downstream-eval, what is mask trying to do?
             # Support for downstream-eval might come later. 
             dense_block = mask.to_dense() 
             block_size = mask.BLOCK_SIZE  
@@ -441,21 +426,19 @@ class AttentiveSSM(nn.Module):
             mask = mask[:, :, :Lq, :Lk]
             attn_mask = mask & attn_mask
         
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+        attn_mask = attn_mask.contiguous()
+
         output = F.scaled_dot_product_attention(
-            xq,        # [B, H_q, L_q, D]
-            xk_processed,      # [B, H_q, L_k, D]
-            xv_processed,      # [B, H_q, L_k, D]
-            attn_mask=attn_mask,  # [B, H_q, L_q, L_k], True indicates positions to be masked
+            xq,
+            xk_processed,
+            xv_processed,
+            attn_mask=attn_mask,
             is_causal=False
         )
-        # Output shape: [B, H_q, L_q, D]
-        # Transpose back to [B, L_q, H_q, D]
         output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
 
-        # else:
-        #     raise NotImplementedError(f"Attention implementation {attn_impl} not supported")
-
-        # Final linear projection
         output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
 
         return output
