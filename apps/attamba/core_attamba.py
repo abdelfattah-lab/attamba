@@ -53,6 +53,7 @@ class BaseAttambaArgs:
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
 
+    norm_eps: float = 1e-5
 
     state_dim: int = 128
     n_groups: int = 1
@@ -410,6 +411,8 @@ class AttambaBlock(nn.Module):
             learnable_init_states=args.learnable_init_states,
             chunk_size=args.ssm_chunk_size,
         )
+
+        self.k_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
         
         self.v_ssm = SSM(
             dim=args.kvssm_dim,
@@ -425,6 +428,9 @@ class AttambaBlock(nn.Module):
             learnable_init_states=args.learnable_init_states,
             chunk_size=args.ssm_chunk_size,
         )
+
+        self.v_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
+
         
         self.attentive_ssm = AttentiveSSM(
             dim=args.dim,
@@ -435,6 +441,8 @@ class AttambaBlock(nn.Module):
             rope_theta=args.init_args.dt_max,
             k_ssm=self.k_ssm,
             v_ssm=self.v_ssm,
+            k_ssmnorm=self.k_ssmnorm,
+            v_ssmnorm=self.v_ssmnorm,
             chunk_size=args.ssm_chunk_size,
         )
         self.feed_forward = FeedForward(
@@ -474,6 +482,9 @@ class AttambaBlock(nn.Module):
         self.k_ssm.reset_parameters(init_std, factor, init_args)
         self.v_ssm.reset_parameters(init_std, factor, init_args)
         
+        self.k_ssmnorm.reset_parameters()
+        self.v_ssmnorm.reset_parameters()
+
         self.k_ssm.ssm_norm.reset_parameters()
         self.v_ssm.ssm_norm.reset_parameters()
 

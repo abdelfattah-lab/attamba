@@ -60,7 +60,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 1000
+        every: 5000
         keep: -1
         
 logging:
@@ -70,14 +70,14 @@ logging:
 
 eval:
     generator:
-        max_tokens: 8192
+        max_tokens: 1024
         dtype: bf16
         # temperature: 1.0
         # top_p: 0.95
     harness:
         tasks:
             - wikitext
-            # - piqa
+            - piqa
             # - arc_easy
             # - gsm8k
             # - wikitext

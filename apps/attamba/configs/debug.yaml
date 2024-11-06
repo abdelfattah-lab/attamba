@@ -2,8 +2,8 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/debugdump/dbd_attamba_8"
-name: "dbd_attamba_8"
+dump_dir: "/scratch/ya255/lingua/debugdump/dbd_attamba"
+name: "dbd_attamba"
 
 steps: 60_000
 probe_freq: null
@@ -32,9 +32,9 @@ model:
     n_heads: 8
     
     # ssm params
-    kvssm_dim: 128      # Should be same as head-dim (* n_kv_heads likely)
+    kvssm_dim: 32      # Should be same as head-dim (* n_kv_heads likely)
     state_dim: 32
-    ssm_chunk_size: 32  # Should be same as token_chunk
+    ssm_chunk_size: 32  # Should be same as token_chunk ?
     n_groups: 1
     ssm_hiddim: 32
     # ssm_hiddim: 32
@@ -78,7 +78,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 200
+        every: 5000
         keep: -1
 
 logging:
@@ -96,9 +96,7 @@ eval:
     harness:
         tasks:
             - wikitext
-            
-
-            # - piqa
+            - piqa
             # - arc_easy
             # - gsm8k
 
