@@ -303,9 +303,8 @@ class AttentiveSSM(nn.Module):
         token_chunk: int,
         rope_theta: float,
         k_ssm: nn.Module,
-        v_ssm: nn.Module,
         k_ssmnorm: nn.Module,
-        v_ssmnorm: nn.Module,
+        residual_ssm: bool = False,
         chunk_size: int = 256,
     ):
         super().__init__()
@@ -317,9 +316,8 @@ class AttentiveSSM(nn.Module):
         self.chunk_size = chunk_size
         self.token_chunk = token_chunk
         self.k_ssm = k_ssm
-        self.v_ssm = v_ssm
-        self.k_ssmnorm = k_ssmnorm 
-        self.v_ssmnorm = v_ssmnorm
+        self.k_ssmnorm = k_ssmnorm
+        self.residual_ssm = residual_ssm
 
         self.rope_theta = rope_theta
         self.heads_per_group = self.n_heads // self.n_kv_heads
@@ -330,26 +328,6 @@ class AttentiveSSM(nn.Module):
         self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
         
-
-    def process_chunks_with_ssm(self, x, ssm_module):
-        bsz, seq_len, n_kv_heads, head_dim = x.shape
-        K = self.token_chunk
-        num_chunks = (seq_len + K - 1) // K
-        pad_len = num_chunks * K - seq_len
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
-
-        x = x.view(bsz, num_chunks, K, n_kv_heads, head_dim)
-
-        bsz, num_chunks, K, n_kv_heads, head_dim = x.shape
-        x = x.reshape(bsz * num_chunks, K, n_kv_heads * head_dim).contiguous()
-        if hasattr(ssm_module, "cache"):
-            del ssm.cache   # State-less compressor
-        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
-
-        ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, n_kv_heads, head_dim)
-
-        return ssm_outputs[:, :, :self.token_chunk, :, :]
 
     def base_process_chunks_with_ssm(self, x, ssm_module):
         bsz, seq_len, hssm, edim = x.shape
@@ -384,57 +362,29 @@ class AttentiveSSM(nn.Module):
         head_dim = self.head_dim
         device = x.device
         K = self.token_chunk
-        if False:
-            # Already proved the 
-            # Linear projecctions
-            xq = self.wq(x.view_as(x))
-            xk = self.wk(x.view_as(x))
-            xv = self.wv(x.view_as(x))
+        
+        # Project queries
+        xq = self.wq(x.view_as(x))
+        bsz, seq_len, edim = x.size()
+        # Map to SSM for parallel head
+        x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
+        # Process with residual -- potential problem on residual for perf-optimal
+        x_processed = self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
+        if self.residual_ssm:
+            x_processed = x_processed + x
+        x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
 
-            output_shape = xq.shape
+        # Project cumulative states to Key-Value
+        xk_processed = self.wk(x_processed.view_as(x))
+        xv_processed = self.wv(x_processed.view_as(x))
 
-            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-            xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
-            xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
-
-            # Apply rotary embedding for attention mechanism
-            # TODO(akhauri@): rotary embedding should be reduced
-            #                 per-chunk positional embedding implications...
-            #                 would SSM capture this?
-            # xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis_squeezed)
-
-            # if hasattr(self, "kv_cache"):
-            #     xk, xv = self.kv_cache.update(xk, xv, tok_idx)
-
-            xk_ssm_outputs = self.process_chunks_with_ssm(self.k_ssmnorm(xk), self.k_ssm) # B NC K H D
-            xv_ssm_outputs = self.process_chunks_with_ssm(self.v_ssmnorm(xv), self.v_ssm) # B NC K H D
-            xk_processed = xk_ssm_outputs.reshape(bsz, -1, n_kv_heads, head_dim)  # [B, L_p, H_kv, D]
-            xv_processed = xv_ssm_outputs.reshape(bsz, -1, n_kv_heads, head_dim)  # [B, L_p, H_kv, D]
-            xk_processed = xk_processed[:, :L_q, :, :]  # [B, L, H_kv, D]
-            xv_processed = xv_processed[:, :L_q, :, :]  # [B, L, H_kv, D]
-
-            xk_processed = xk_processed + xk
-            xv_processed = xv_processed + xv
-        else:
-            xq = self.wq(x.view_as(x))
-            # if self.k_ssm.in_proj.in_features != x.size(2):
-            bsz, seq_len, edim = x.size()
-            # assert edim % self.k_ssm.in_proj.in_features == 0, "Head-dim must be a multiple of SSM inproj"
-            x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
-            x_processed = x + self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
-            x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
-
-            # Project cumulative states
-            xk_processed = self.wk(x_processed.view_as(x))
-            xv_processed = self.wv(x_processed.view_as(x))
-
-            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-            xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            
-
+        # Reshape for attention
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+        
+        # Apply positional encoding -- potential problem: chunked rotary?
         freq_cis_squeezed = freq_cis.squeeze(0)[:seq_len]
-        # Here, should rotary embedding be re-indexed?
         xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis_squeezed)
 
         if hasattr(self, "kv_cache"):

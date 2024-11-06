@@ -36,8 +36,8 @@ model:
     state_dim: 32
     ssm_chunk_size: 32  # Should be same as token_chunk ?
     n_groups: 1
+    residual_ssm: false
     ssm_hiddim: 32
-    # ssm_hiddim: 32
     learnable_init_states: false
     ssm_heads: 8
     conv_size: 4

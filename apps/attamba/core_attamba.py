@@ -57,6 +57,7 @@ class BaseAttambaArgs:
 
     state_dim: int = 128
     n_groups: int = 1
+    residual_ssm: bool = False
     conv_size: Optional[int] = None
 
     dt_bias: bool = False
@@ -414,24 +415,6 @@ class AttambaBlock(nn.Module):
 
         self.k_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
         
-        self.v_ssm = SSM(
-            dim=args.kvssm_dim,
-            hidden_dim=args.ssm_hiddim,
-            multiple_of=args.multiple_of,
-            ffn_dim_multiplier=args.ffn_dim_multiplier,
-            state_dim=args.state_dim,
-            n_heads=args.ssm_heads,
-            n_groups=args.n_groups,
-            conv_size=args.conv_size,
-            dt_bias=args.dt_bias,
-            D_has_head_dim=args.D_has_head_dim,
-            learnable_init_states=args.learnable_init_states,
-            chunk_size=args.ssm_chunk_size,
-        )
-
-        self.v_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
-
-        
         self.attentive_ssm = AttentiveSSM(
             dim=args.dim,
             head_dim=args.head_dim,
@@ -440,10 +423,9 @@ class AttambaBlock(nn.Module):
             token_chunk=args.token_chunk,
             rope_theta=args.init_args.dt_max,
             k_ssm=self.k_ssm,
-            v_ssm=self.v_ssm,
             k_ssmnorm=self.k_ssmnorm,
-            v_ssmnorm=self.v_ssmnorm,
             chunk_size=args.ssm_chunk_size,
+            residual_ssm=args.residual_ssm,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -480,13 +462,10 @@ class AttambaBlock(nn.Module):
     def init_weights(self, init_std=None, factor=1.0, init_args: InitArgs = InitArgs()):
         # self.ssm_norm.reset_parameters()
         self.k_ssm.reset_parameters(init_std, factor, init_args)
-        self.v_ssm.reset_parameters(init_std, factor, init_args)
         
         self.k_ssmnorm.reset_parameters()
-        self.v_ssmnorm.reset_parameters()
 
         self.k_ssm.ssm_norm.reset_parameters()
-        self.v_ssm.ssm_norm.reset_parameters()
 
         self.attention_norm.reset_parameters()
         self.attentive_ssm.reset_parameters(init_std, factor)
