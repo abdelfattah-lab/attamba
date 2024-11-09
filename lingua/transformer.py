@@ -336,50 +336,22 @@ class AttentiveSSM(nn.Module):
         self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
         
-
-    def base_process_chunks_with_ssm(self, x, ssm_module, tok_idx=None, cu_seqlens=None):
-        bsz, seq_len, hssm, edim = x.shape
-        K = self.token_chunk
-        num_chunks = (seq_len + K - 1) // K
-        pad_len = num_chunks * K - seq_len
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len, 0, 0)).contiguous()
-        x = x.view(bsz, num_chunks, K, hssm, edim)
-        bsz, num_chunks, K, hssm, edim = x.shape
-        x = x.permute(0, 1, 3, 2, 4).reshape(bsz * num_chunks * hssm, K, edim).contiguous()
-        if hasattr(ssm_module, "cache"):
-            del ssm.cache
-        # ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
-
-        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
-        ssm_outputs = ssm_outputs.view(bsz, num_chunks, hssm, K, edim).permute(0, 1, 3, 2, 4).contiguous()
-        ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, hssm, edim)
-        return ssm_outputs[:, :seq_len, :, :]
-    
     def process_chunks_with_ssm(self, x, ssm_module, tok_idx=None, cu_seqlens=None):
         bsz, seq_len, edim = x.shape
         K = self.token_chunk
         num_chunks = (seq_len + K - 1) // K
         pad_len = num_chunks * K - seq_len
         if pad_len > 0:
-            # x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
             x = F.pad(x, (0, 0, 0, pad_len, 0, 0)).contiguous()
 
         x = x.view(bsz * num_chunks, K, edim)
-
         if hasattr(ssm_module, "cache"):
             del ssm.cache
         # ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
-
         ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
-        # Correct reshaping and slicing
         ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, edim)
         ssm_outputs = ssm_outputs[:, :seq_len, :]
         return ssm_outputs
-        # ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, edim)
-        # ssm_outputs = ssm_outputs[:, :seq_len, :, :].view(bsz, seq_len, edim)
-        # return ssm_outputs
-
 
     def forward(
         self,
@@ -404,9 +376,16 @@ class AttentiveSSM(nn.Module):
         if self.kv_pressm:
             xk = self.wk(x)
             xv = self.wv(x)
+            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+            xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
+            xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
+
             xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis)
             if hasattr(self, "kv_cache"):
                 xk, xv = self.kv_cache.update(xk, xv, tok_idx)
+
+            xk = xk.view(bsz, -1, n_kv_heads * head_dim)
+            xv = xv.view(bsz, -1, n_kv_heads * head_dim)
 
             if self.v_ssm is None:
                 raise NotImplementedError("Double-Pump SSMs mandatory for Pre-SSM KV-Cache")
@@ -417,17 +396,11 @@ class AttentiveSSM(nn.Module):
                     xk_processed = xk_processed + xk
                     xv_processed = xv_processed + xv
 
-            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-            xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+            xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+            xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
         else:
             if self.v_ssm is None:
-                if False:
-                    x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
-                    x_processed = self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
-                    x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
-                else:
-                    x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
+                x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
                 if self.residual_ssm:
                     x_processed = x_processed + x
                 xk_processed = self.wk(x_processed)
