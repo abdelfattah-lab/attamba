@@ -52,6 +52,7 @@ class BaseAttambaArgs:
     n_layers: int = 8
     n_heads: int = 8
     token_chunk: int = 32
+    kv_pressm: bool = False
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
 
@@ -453,6 +454,7 @@ class AttambaBlock(nn.Module):
             k_ssmnorm=self.k_ssmnorm,
             v_ssm=self.v_ssm,
             v_ssmnorm=self.v_ssmnorm,
+            kv_pressm=args.kv_pressm,
             chunk_size=args.ssm_chunk_size,
             residual_ssm=args.residual_ssm,
             pseudo_chunk=args.pseudo_chunk,

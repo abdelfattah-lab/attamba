@@ -306,6 +306,7 @@ class AttentiveSSM(nn.Module):
         k_ssmnorm: nn.Module,
         v_ssm,
         v_ssmnorm,
+        kv_pressm: bool = False,
         residual_ssm: bool = False,
         chunk_size: int = 256,
         pseudo_chunk: bool = False,
@@ -324,6 +325,7 @@ class AttentiveSSM(nn.Module):
         self.v_ssmnorm = v_ssmnorm
         self.residual_ssm = residual_ssm
         self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
 
         self.rope_theta = rope_theta
         self.heads_per_group = self.n_heads // self.n_kv_heads
@@ -399,31 +401,51 @@ class AttentiveSSM(nn.Module):
         K = self.token_chunk
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
-        if self.v_ssm is None:
-            if False:
-                x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
-                x_processed = self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
-                x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
-            else:
-                x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
-            if self.residual_ssm:
-                x_processed = x_processed + x
-            xk_processed = self.wk(x_processed)
-            xv_processed = self.wv(x_processed)
-        else:
+        if self.kv_pressm:
             xk = self.wk(x)
             xv = self.wv(x)
-            xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
-            xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
-            if self.residual_ssm:
-                xk_processed = xk_processed + xk
-                xv_processed = xv_processed + xv
-        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-        xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-        xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
-        if hasattr(self, "kv_cache"):
-            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+            xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis)
+            if hasattr(self, "kv_cache"):
+                xk, xv = self.kv_cache.update(xk, xv, tok_idx)
+
+            if self.v_ssm is None:
+                raise NotImplementedError("Double-Pump SSMs mandatory for Pre-SSM KV-Cache")
+            else:
+                xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
+                xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
+                if self.residual_ssm:
+                    xk_processed = xk_processed + xk
+                    xv_processed = xv_processed + xv
+
+            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+            xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+            xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+        else:
+            if self.v_ssm is None:
+                if False:
+                    x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
+                    x_processed = self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
+                    x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
+                else:
+                    x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
+                if self.residual_ssm:
+                    x_processed = x_processed + x
+                xk_processed = self.wk(x_processed)
+                xv_processed = self.wv(x_processed)
+            else:
+                xk = self.wk(x)
+                xv = self.wv(x)
+                xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
+                xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
+                if self.residual_ssm:
+                    xk_processed = xk_processed + xk
+                    xv_processed = xv_processed + xv
+            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+            xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+            xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+            xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+            if hasattr(self, "kv_cache"):
+                xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
 
         L_k = xk_processed.size(1)
 
@@ -445,26 +467,8 @@ class AttentiveSSM(nn.Module):
             causality_mask = False
             attn_mask = attn_mask.contiguous()
 
-        
-        # if mask != "causal":
-        #     assert not isinstance(mask, AttentionBias), "We dont support fmha here."
-        #     # Support for downstream-eval might come later. 
-        #     dense_block = mask.to_dense() 
-        #     block_size = mask.BLOCK_SIZE  
-        #     full_shape = mask.shape
-        #     full_dense_mask = dense_block.repeat_interleave(block_size[0], dim=2).repeat_interleave(block_size[1], dim=3)
-        #     mask = full_dense_mask.expand(bsz, n_heads, -1, -1).bool()
-        #     Lq, Lk = attn_mask.size(2), attn_mask.size(3)
-        #     mask = mask[:, :, :Lq, :Lk]
-        #     # Ideally, chunk boundaries DO NOT contain cross-document context,
-        #     # So, simply the intersection of intersection mask and our chunk-mask should be enough.
-        #     # Which means the solution below could work (may relevant item due to boundary (!))
-        #     # Boundary index != doc-index [think a bit more.]
-        #     attn_mask = mask & attn_mask
-
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
         
-
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         output = F.scaled_dot_product_attention(
             xq,
