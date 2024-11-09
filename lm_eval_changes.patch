@@ -1,0 +1,156 @@
+diff --git a/lm_eval/api/metrics.py b/lm_eval/api/metrics.py
+index a8459aa7..34413d66 100644
+--- a/lm_eval/api/metrics.py
++++ b/lm_eval/api/metrics.py
+@@ -40,7 +40,12 @@ def perplexity(items):
+ 
+ @register_aggregation("weighted_perplexity")
+ def weighted_perplexity(items):
+-    return math.exp(-weighted_mean(items))
++    # return math.exp(-weighted_mean(items))
++    mean_value = weighted_mean(items)
++    try:
++        return math.exp(-mean_value)
++    except OverflowError:
++        return float('inf') if mean_value < 0 else 0.0
+ 
+ 
+ @register_aggregation("bits_per_byte")
+@@ -403,8 +408,13 @@ def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+ 
+ def weighted_mean(items):
+     a, b = zip(*items)
+-    return sum(a) / sum(b)
+-
++    a = [x[0] if isinstance(x, tuple) else x for x in a]  # Flatten `a`
++    try:
++        weighted_sum = sum(x * w for x, w in zip(a, b))
++        weight_sum = sum(b)
++        return weighted_sum / weight_sum if weight_sum != 0 else float('inf')
++    except ZeroDivisionError:
++        return float('inf')
+ 
+ def is_non_str_iterable(obj):
+     return isinstance(obj, Iterable) and not isinstance(obj, str)
+diff --git a/lm_eval/api/task.py b/lm_eval/api/task.py
+index 532e9e7a..b5feeea5 100644
+--- a/lm_eval/api/task.py
++++ b/lm_eval/api/task.py
+@@ -454,19 +454,22 @@ class Task(abc.ABC):
+             if not isinstance(inst, list):
+                 inst = [inst]
+ 
+-            instances.append(inst)
++            for instance_item in inst:
++                instances.append(instance_item)
++            # instances.append(inst)
+ 
+         # now flatten, this is to allow slicing to work with pickles
+ 
+         sliced_instances = instances[:og_limit]
+ 
+-        flattened_instances = [
+-            instance
+-            for instance_group in sliced_instances
+-            for instance in instance_group
+-        ]
++        self._instances = sliced_instances
++        # flattened_instances = [
++        #     instance
++        #     for instance_group in sliced_instances
++        #     for instance in instance_group
++        # ]
+ 
+-        self._instances = flattened_instances
++        # self._instances = flattened_instances
+ 
+         if len(self._instances) == 0:
+             raise ValueError("task.build_requests() did not find any docs!")
+diff --git a/lm_eval/evaluator.py b/lm_eval/evaluator.py
+index d0c1a19a..70e04ff5 100644
+--- a/lm_eval/evaluator.py
++++ b/lm_eval/evaluator.py
+@@ -38,6 +38,7 @@ from lm_eval.utils import (
+     simple_parse_args_string,
+ )
+ 
++from tqdm import tqdm
+ 
+ if TYPE_CHECKING:
+     from lm_eval.api.model import LM
+@@ -497,11 +498,23 @@ def evaluate(
+                 cloned_reqs.extend([req] * req.repeats)
+ 
+         # run requests through model
+-        resps = getattr(lm, reqtype)(cloned_reqs)
+-
+-        # put responses from model into a list of length K for each request.
+-        for x, req in zip(resps, cloned_reqs):
+-            req.resps.append(x)
++        # resps = getattr(lm, reqtype)(cloned_reqs)
++        # resps = getattr(lm, reqtype)([req])  # Pass as a single-item list
++        # Add tqdm to show progress
++        for req in tqdm(cloned_reqs, desc=f"Processing {reqtype}"):
++            resps = getattr(lm, reqtype)([req])  # Pass as a single-item list
++            if not resps:
++                eval_logger.warning(f"No response received for request: {req.args['prompt']}")
++                continue  # Skip if no response is returned
++            for resp in resps:
++                req.resps.append(resp)
++
++        # for resp in resps:
++        #     req.resps.append(resp)
++        
++        # # put responses from model into a list of length K for each request.
++        # for x, req in zip(resps, cloned_reqs):
++        #     req.resps.append(x)
+ 
+         if lm.world_size > 1:
+             lm.accelerator.wait_for_everyone()
+diff --git a/lm_eval/filters/selection.py b/lm_eval/filters/selection.py
+index 6e368b59..cdecdce3 100644
+--- a/lm_eval/filters/selection.py
++++ b/lm_eval/filters/selection.py
+@@ -20,7 +20,11 @@ class TakeFirstFilter(Filter):
+         """
+         Assuming each entry of `resps` is a list of model responses, we discard all but the first response.
+         """
+-        return map(lambda r: r[0], resps)
++        def get_first_or_default(r):
++            return r[0] if isinstance(r, list) and len(r) > 0 else (0.0, False)
++
++        return [get_first_or_default(r) for r in resps]
++        # return map(lambda r: r[0], resps)
+ 
+ 
+ @register_filter("take_first_k")
+diff --git a/pyproject.toml b/pyproject.toml
+index b7d1941d..7121a43d 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -19,7 +19,6 @@ classifiers = [
+ requires-python = ">=3.8"
+ license = { "text" = "MIT" }
+ dependencies = [
+-    "accelerate>=0.26.0",
+     "evaluate",
+     "datasets>=2.16.0",
+     "evaluate>=0.4.0",
+@@ -32,9 +31,7 @@ dependencies = [
+     "sacrebleu>=1.5.0",
+     "scikit-learn>=0.24.1",
+     "sqlitedict",
+-    "torch>=1.8",
+     "tqdm-multiprocess",
+-    "transformers>=4.1",
+     "zstandard",
+     "dill",
+     "word2number",
+@@ -65,7 +62,6 @@ hf_transfer = ["hf_transfer"]
+ ibm_watsonx_ai = ["ibm_watsonx_ai"]
+ ifeval = ["langdetect", "immutabledict", "nltk>=3.9.1"]
+ neuronx = ["optimum[neuronx]"]
+-mamba = ["mamba_ssm", "causal-conv1d==1.0.2"]
+ math = ["sympy>=1.12", "antlr4-python3-runtime==4.11"]
+ multilingual = ["nagisa>=0.2.7", "jieba>=0.42.1", "pycountry"]
+ optimum = ["optimum[openvino]"]
