@@ -335,7 +335,7 @@ class AttentiveSSM(nn.Module):
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
         
 
-    def base_process_chunks_with_ssm(self, x, ssm_module):
+    def base_process_chunks_with_ssm(self, x, ssm_module, tok_idx=None, cu_seqlens=None):
         bsz, seq_len, hssm, edim = x.shape
         K = self.token_chunk
         num_chunks = (seq_len + K - 1) // K
@@ -347,12 +347,12 @@ class AttentiveSSM(nn.Module):
         x = x.permute(0, 1, 3, 2, 4).reshape(bsz * num_chunks * hssm, K, edim).contiguous()
         if hasattr(ssm_module, "cache"):
             del ssm.cache
-        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
+        ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
         ssm_outputs = ssm_outputs.view(bsz, num_chunks, hssm, K, edim).permute(0, 1, 3, 2, 4).contiguous()
         ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, hssm, edim)
         return ssm_outputs[:, :seq_len, :, :]
     
-    def process_chunks_with_ssm(self, x, ssm_module):
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx=None, cu_seqlens=None):
         bsz, seq_len, edim = x.shape
         K = self.token_chunk
         num_chunks = (seq_len + K - 1) // K
@@ -364,7 +364,7 @@ class AttentiveSSM(nn.Module):
 
         if hasattr(ssm_module, "cache"):
             del ssm.cache
-        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
+        ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
         ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, edim)
         ssm_outputs = ssm_outputs[:, :seq_len, :, :].view(bsz, seq_len, edim)
         return ssm_outputs
@@ -376,6 +376,7 @@ class AttentiveSSM(nn.Module):
         freq_cis: torch.Tensor,
         cu_seqlens: Optional[torch.Tensor],
         tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
         ssm_impl: str = "training",
         attn_impl: str = "sdpa",
@@ -391,6 +392,11 @@ class AttentiveSSM(nn.Module):
         # Project queries
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
+
+        if ssm_tok_idx != None:
+            # Here, we need to ensure the SSM chunking also handles
+            # tok_idx and cu_seqlens boundaries correctly.
+            import pdb; pdb.set_trace()
         # Map to SSM for parallel head
         # Process with residual
         if self.v_ssm is None:
@@ -463,9 +469,14 @@ class AttentiveSSM(nn.Module):
             mask = full_dense_mask.expand(bsz, n_heads, -1, -1).bool()
             Lq, Lk = attn_mask.size(2), attn_mask.size(3)
             mask = mask[:, :, :Lq, :Lk]
+            # Ideally, chunk boundaries DO NOT contain cross-document context,
+            # So, simply the intersection of intersection mask and our chunk-mask should be enough.
+            # Which means the solution below could work (may relevant item due to boundary (!))
+            # Boundary index != doc-index [think a bit more.]
             attn_mask = mask & attn_mask
 
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+        
 
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         output = F.scaled_dot_product_attention(

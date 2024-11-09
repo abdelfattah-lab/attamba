@@ -193,6 +193,8 @@ class PackedCausalAttambaGenerator:
         self.current_doc_id, self.current_tok_id = None, None
         self.padded_doc_start = None
         self.prefill_mask = None
+        self.ssm_prefill_tok_id = None
+        self.cu_seqlens = None
 
     def clear_cache(self, offset):
         for module in self.model.modules():
@@ -275,6 +277,11 @@ class PackedCausalAttambaGenerator:
         # padded_doc_id 00000111111 padded_tok_id 01234012345
         # This will later be useful for the attention mask at generation
         self.padded_doc_id, self.padded_tok_id = lengths_to_local_ids(padded_lengths)
+        self.ssm_prefill_tok_id = torch.repeat_interleave(lengths).unsqueeze(0).int()
+        self.cu_seqlens = lengths.cumsum(0)
+        self.cu_seqlens = torch.cat(
+            [torch.tensor([0], device=self.device), self.cu_seqlens]
+        ).int()
 
     @torch.compiler.disable
     def setup_generation(self, lengths):
@@ -294,11 +301,14 @@ class PackedCausalAttambaGenerator:
         # Prefilling is done by taking multiple packed sequences and
         # doing block diagonal attention on them so they remain independent
         self.setup_prefilling(lengths=lengths)
+        import pdb; pdb.set_trace()
         # Disable the prefill block-masking
         prefill_out = self.model.forward(
             tokens,
             tok_idx=self.prefill_tok_id,
             mask=self.prefill_mask,
+            ssm_tok_idx=self.ssm_prefill_tok_id,
+            cu_seqlens=self.cu_seqlens,
             attn_impl="flex_attention",
         )
 
