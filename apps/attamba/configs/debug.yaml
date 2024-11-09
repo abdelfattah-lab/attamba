@@ -25,21 +25,21 @@ distributed:
     tp_size: 1
 
 model:
-    dim: 1024
+    dim: 256
     token_chunk: 8
     pseudo_chunk: false
-    head_dim: 128
+    head_dim: 32
     n_layers: 8
     n_heads: 8
     
     # ssm params
     sep_ssm: true
-    kvssm_dim: 1024
-    state_dim: 512
+    kvssm_dim: 256
+    state_dim: 256
     ssm_chunk_size: 32  # Should be same as token_chunk ?
     n_groups: 1
     residual_ssm: true
-    ssm_hiddim: 512         # hidden_dim  -- [MATCH (?) dim]
+    ssm_hiddim: 256         # hidden_dim  -- [MATCH (?) dim]
     learnable_init_states: false
     ssm_heads: 8
     # null
@@ -81,7 +81,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 50
+        every: 10
         keep: -1
 
 logging:
@@ -100,8 +100,9 @@ eval:
         tasks:
             # - wikitext
             - piqa
-            # - arc_easy
-            # - gsm8k
+            - winogrande
+            - arc_easy
+            - gsm8k
 
             # - task: nq_open
             #   num_fewshot: 5

@@ -341,13 +341,15 @@ class AttentiveSSM(nn.Module):
         num_chunks = (seq_len + K - 1) // K
         pad_len = num_chunks * K - seq_len
         if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
+            x = F.pad(x, (0, 0, 0, pad_len, 0, 0)).contiguous()
         x = x.view(bsz, num_chunks, K, hssm, edim)
         bsz, num_chunks, K, hssm, edim = x.shape
         x = x.permute(0, 1, 3, 2, 4).reshape(bsz * num_chunks * hssm, K, edim).contiguous()
         if hasattr(ssm_module, "cache"):
             del ssm.cache
-        ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
+        # ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
+
+        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
         ssm_outputs = ssm_outputs.view(bsz, num_chunks, hssm, K, edim).permute(0, 1, 3, 2, 4).contiguous()
         ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, hssm, edim)
         return ssm_outputs[:, :seq_len, :, :]
@@ -358,16 +360,23 @@ class AttentiveSSM(nn.Module):
         num_chunks = (seq_len + K - 1) // K
         pad_len = num_chunks * K - seq_len
         if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
+            # x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
+            x = F.pad(x, (0, 0, 0, pad_len, 0, 0)).contiguous()
 
         x = x.view(bsz * num_chunks, K, edim)
 
         if hasattr(ssm_module, "cache"):
             del ssm.cache
-        ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
-        ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, edim)
-        ssm_outputs = ssm_outputs[:, :seq_len, :, :].view(bsz, seq_len, edim)
+        # ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
+
+        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
+        # Correct reshaping and slicing
+        ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, edim)
+        ssm_outputs = ssm_outputs[:, :seq_len, :]
         return ssm_outputs
+        # ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, edim)
+        # ssm_outputs = ssm_outputs[:, :seq_len, :, :].view(bsz, seq_len, edim)
+        # return ssm_outputs
 
 
     def forward(
@@ -388,17 +397,8 @@ class AttentiveSSM(nn.Module):
         head_dim = self.head_dim
         device = x.device
         K = self.token_chunk
-        
-        # Project queries
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
-
-        if ssm_tok_idx != None:
-            # Here, we need to ensure the SSM chunking also handles
-            # tok_idx and cu_seqlens boundaries correctly.
-            import pdb; pdb.set_trace()
-        # Map to SSM for parallel head
-        # Process with residual
         if self.v_ssm is None:
             if False:
                 x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
@@ -408,8 +408,6 @@ class AttentiveSSM(nn.Module):
                 x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
             if self.residual_ssm:
                 x_processed = x_processed + x
-            # Project cumulative states to Key-Value
-            # This will take from dim to make it n_kv_heads * head_dim
             xk_processed = self.wk(x_processed)
             xv_processed = self.wv(x_processed)
         else:
@@ -417,24 +415,13 @@ class AttentiveSSM(nn.Module):
             xv = self.wv(x)
             xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
             xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
-            
             if self.residual_ssm:
                 xk_processed = xk_processed + xk
                 xv_processed = xv_processed + xv
-            
-            # xk_processed = self.wk(xk_processed)
-            # xv_processed = self.wv(xv_processed)
-
-        # Reshape for attention
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
         xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            
-            
-        # Apply positional encoding -- potential problem: chunked rotary?
-        freq_cis_squeezed = freq_cis.squeeze(0)[:seq_len]
-        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis_squeezed)
-
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
         if hasattr(self, "kv_cache"):
             xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
 
@@ -459,21 +446,21 @@ class AttentiveSSM(nn.Module):
             attn_mask = attn_mask.contiguous()
 
         
-        if mask != "causal":
-            assert not isinstance(mask, AttentionBias), "We dont support fmha here."
-            # Support for downstream-eval might come later. 
-            dense_block = mask.to_dense() 
-            block_size = mask.BLOCK_SIZE  
-            full_shape = mask.shape
-            full_dense_mask = dense_block.repeat_interleave(block_size[0], dim=2).repeat_interleave(block_size[1], dim=3)
-            mask = full_dense_mask.expand(bsz, n_heads, -1, -1).bool()
-            Lq, Lk = attn_mask.size(2), attn_mask.size(3)
-            mask = mask[:, :, :Lq, :Lk]
-            # Ideally, chunk boundaries DO NOT contain cross-document context,
-            # So, simply the intersection of intersection mask and our chunk-mask should be enough.
-            # Which means the solution below could work (may relevant item due to boundary (!))
-            # Boundary index != doc-index [think a bit more.]
-            attn_mask = mask & attn_mask
+        # if mask != "causal":
+        #     assert not isinstance(mask, AttentionBias), "We dont support fmha here."
+        #     # Support for downstream-eval might come later. 
+        #     dense_block = mask.to_dense() 
+        #     block_size = mask.BLOCK_SIZE  
+        #     full_shape = mask.shape
+        #     full_dense_mask = dense_block.repeat_interleave(block_size[0], dim=2).repeat_interleave(block_size[1], dim=3)
+        #     mask = full_dense_mask.expand(bsz, n_heads, -1, -1).bool()
+        #     Lq, Lk = attn_mask.size(2), attn_mask.size(3)
+        #     mask = mask[:, :, :Lq, :Lk]
+        #     # Ideally, chunk boundaries DO NOT contain cross-document context,
+        #     # So, simply the intersection of intersection mask and our chunk-mask should be enough.
+        #     # Which means the solution below could work (may relevant item due to boundary (!))
+        #     # Boundary index != doc-index [think a bit more.]
+        #     attn_mask = mask & attn_mask
 
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
         

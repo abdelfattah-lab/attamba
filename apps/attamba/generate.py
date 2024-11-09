@@ -301,7 +301,6 @@ class PackedCausalAttambaGenerator:
         # Prefilling is done by taking multiple packed sequences and
         # doing block diagonal attention on them so they remain independent
         self.setup_prefilling(lengths=lengths)
-        import pdb; pdb.set_trace()
         # Disable the prefill block-masking
         prefill_out = self.model.forward(
             tokens,

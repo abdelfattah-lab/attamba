@@ -100,6 +100,7 @@ class LMAttamba(BaseAttamba):
         token_values: torch.Tensor,
         target: Optional[torch.Tensor] = None,
         tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
         cu_seqlens: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, AttentionBias, torch.Tensor, str]] = None,
         ssm_impl: str = "ssm",
@@ -115,7 +116,7 @@ class LMAttamba(BaseAttamba):
         )
 
         h = super().forward(
-            h, tok_idx=tok_idx, cu_seqlens=cu_seqlens, mask=mask, attn_impl=attn_impl, ssm_impl=ssm_impl
+            h, ssm_tok_idx=ssm_tok_idx, tok_idx=tok_idx, cu_seqlens=cu_seqlens, mask=mask, attn_impl=attn_impl, ssm_impl=ssm_impl
         )
 
         logits = self.output(self.norm(h))
