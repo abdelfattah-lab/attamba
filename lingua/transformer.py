@@ -304,8 +304,11 @@ class AttentiveSSM(nn.Module):
         rope_theta: float,
         k_ssm: nn.Module,
         k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
         residual_ssm: bool = False,
         chunk_size: int = 256,
+        pseudo_chunk: bool = False,
     ):
         super().__init__()
         
@@ -317,7 +320,10 @@ class AttentiveSSM(nn.Module):
         self.token_chunk = token_chunk
         self.k_ssm = k_ssm
         self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
         self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
 
         self.rope_theta = rope_theta
         self.heads_per_group = self.n_heads // self.n_kv_heads
@@ -338,12 +344,31 @@ class AttentiveSSM(nn.Module):
             x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
         x = x.view(bsz, num_chunks, K, hssm, edim)
         bsz, num_chunks, K, hssm, edim = x.shape
-        x = x.reshape(bsz * num_chunks, K, hssm, edim).contiguous()
+        x = x.permute(0, 1, 3, 2, 4).reshape(bsz * num_chunks * hssm, K, edim).contiguous()
         if hasattr(ssm_module, "cache"):
             del ssm.cache
         ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
-        ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, hssm,  edim)
+        ssm_outputs = ssm_outputs.view(bsz, num_chunks, hssm, K, edim).permute(0, 1, 3, 2, 4).contiguous()
+        ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, hssm, edim)
         return ssm_outputs[:, :seq_len, :, :]
+    
+    def process_chunks_with_ssm(self, x, ssm_module):
+        bsz, seq_len, edim = x.shape
+        K = self.token_chunk
+        num_chunks = (seq_len + K - 1) // K
+        pad_len = num_chunks * K - seq_len
+        if pad_len > 0:
+            x = F.pad(x, (0, 0, 0, 0, 0, pad_len)).contiguous()
+
+        x = x.view(bsz * num_chunks, K, edim)
+
+        if hasattr(ssm_module, "cache"):
+            del ssm.cache
+        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
+        ssm_outputs = ssm_outputs.view(bsz, num_chunks, K, edim)
+        ssm_outputs = ssm_outputs[:, :seq_len, :, :].view(bsz, seq_len, edim)
+        return ssm_outputs
+
 
     def forward(
         self,
@@ -364,25 +389,42 @@ class AttentiveSSM(nn.Module):
         K = self.token_chunk
         
         # Project queries
-        xq = self.wq(x.view_as(x))
+        xq = self.wq(x)
         bsz, seq_len, edim = x.size()
         # Map to SSM for parallel head
-        x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
-        # Process with residual -- potential problem on residual for perf-optimal
-        x_processed = self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
-        if self.residual_ssm:
-            x_processed = x_processed + x
-        x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
-
-        # Project cumulative states to Key-Value
-        xk_processed = self.wk(x_processed.view_as(x))
-        xv_processed = self.wv(x_processed.view_as(x))
+        # Process with residual
+        if self.v_ssm is None:
+            if False:
+                x = x.view(bsz, seq_len, edim // self.k_ssm.in_proj.in_features, -1) # B L Hssm D
+                x_processed = self.base_process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm) # B NC K HSSM, Edim
+                x_processed = x_processed.reshape(x.size(0), x.size(1), -1)  # [B, L_p, D]
+            else:
+                x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
+            if self.residual_ssm:
+                x_processed = x_processed + x
+            # Project cumulative states to Key-Value
+            # This will take from dim to make it n_kv_heads * head_dim
+            xk_processed = self.wk(x_processed)
+            xv_processed = self.wv(x_processed)
+        else:
+            xk = self.wk(x)
+            xv = self.wv(x)
+            xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
+            xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
+            
+            if self.residual_ssm:
+                xk_processed = xk_processed + xk
+                xv_processed = xv_processed + xv
+            
+            # xk_processed = self.wk(xk_processed)
+            # xv_processed = self.wv(xv_processed)
 
         # Reshape for attention
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
         xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-        
+            
+            
         # Apply positional encoding -- potential problem: chunked rotary?
         freq_cis_squeezed = freq_cis.squeeze(0)[:seq_len]
         xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis_squeezed)
@@ -395,18 +437,22 @@ class AttentiveSSM(nn.Module):
         xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
         xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
 
-        chunk_boundaries = torch.arange(K - 1, L_k, K, device=device)  # Positions K-1, 2K-1, 3K-1, ...
-        is_chunk_boundary = torch.zeros(L_k, dtype=torch.bool, device=device)
-        is_chunk_boundary[chunk_boundaries] = True
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            chunk_boundaries = torch.arange(K - 1, L_k, K, device=device)  # Positions K-1, 2K-1, 3K-1, ...
+            is_chunk_boundary = torch.zeros(L_k, dtype=torch.bool, device=device)
+            is_chunk_boundary[chunk_boundaries] = True
+            t_abs = torch.arange(L_q, device=device) + (L_k - L_q)  # [L_q]
+            t_abs = t_abs.unsqueeze(1)  # [L_q, 1]
+            k_abs = torch.arange(L_k, device=device).unsqueeze(0)  # [1, L_k]
+            mask_condition = ((k_abs < t_abs) & is_chunk_boundary.unsqueeze(0)) | (k_abs == (t_abs - 1))  # [L_q, L_k]
+            attn_mask = mask_condition.unsqueeze(0).unsqueeze(0).expand(bsz, n_heads, -1, -1)  # [B, H, L_q, L_k]
+            causality_mask = False
+            attn_mask = attn_mask.contiguous()
 
-        t_abs = torch.arange(L_q, device=device) + (L_k - L_q)  # [L_q]
         
-        t_abs = t_abs.unsqueeze(1)  # [L_q, 1]
-        k_abs = torch.arange(L_k, device=device).unsqueeze(0)  # [1, L_k]
-
-        mask_condition = ((k_abs < t_abs) & is_chunk_boundary.unsqueeze(0)) | (k_abs == (t_abs - 1))  # [L_q, L_k]
-
-        attn_mask = mask_condition.unsqueeze(0).unsqueeze(0).expand(bsz, n_heads, -1, -1)  # [B, H, L_q, L_k]
         if mask != "causal":
             assert not isinstance(mask, AttentionBias), "We dont support fmha here."
             # Support for downstream-eval might come later. 
@@ -418,17 +464,16 @@ class AttentiveSSM(nn.Module):
             Lq, Lk = attn_mask.size(2), attn_mask.size(3)
             mask = mask[:, :, :Lq, :Lk]
             attn_mask = mask & attn_mask
-        
 
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
-        attn_mask = attn_mask.contiguous()
 
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         output = F.scaled_dot_product_attention(
             xq,
             xk_processed,
             xv_processed,
             attn_mask=attn_mask,
-            is_causal=False
+            is_causal=causality_mask
         )
         output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
 

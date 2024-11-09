@@ -1,12 +1,7 @@
 # Template config, need to change dump_dir, data.root_dir and tokenizer.path
 
-dump_dir: "/scratch/ya255/lingua/debugdump/full_xmer"
-name: "full_xmer"
-#     Steps Tokens Covered
-# 2    1000      1 million
-# 3   10000     10 million
-# 4  100000    102 million
-
+dump_dir: "/scratch/ya255/lingua/debugdump/xmer_210m_10L"
+name: "xmer_210m_10L"
 steps: 60_000
 probe_freq: null
 seed: 777
@@ -28,7 +23,7 @@ distributed:
 
 model:
     dim: 1024
-    n_layers: 8
+    n_layers: 10
     n_heads: 8
 
 data:
@@ -60,7 +55,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 5000
+        every: 50010
         keep: -1
         
 logging:
@@ -72,14 +67,7 @@ eval:
     generator:
         max_tokens: 1024
         dtype: bf16
-        # temperature: 1.0
-        # top_p: 0.95
     harness:
         tasks:
             - wikitext
             - piqa
-            # - arc_easy
-            # - gsm8k
-            # - wikitext
-            # - task: nq_open
-            #   num_fewshot: 5

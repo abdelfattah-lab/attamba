@@ -45,6 +45,8 @@ class InitArgs:
 class BaseAttambaArgs:
 
     dim: int = 512
+    pseudo_chunk: bool = False
+    sep_ssm: bool = False
     ssm_hiddim: int = 512
     kvssm_dim: int = 32
     n_layers: int = 8
@@ -93,6 +95,7 @@ class SSM(nn.Module):
     def __init__(
         self,
         dim: int,
+        odim: int,
         hidden_dim: int,
         multiple_of: int,
         ffn_dim_multiplier: Optional[float],
@@ -110,7 +113,8 @@ class SSM(nn.Module):
         super().__init__()
 
         self.dim = dim
-
+        self.odim = odim
+        # self.hidden_dim = hidden_dim
         hidden_dim = int(2 * hidden_dim / 3)
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
@@ -162,7 +166,7 @@ class SSM(nn.Module):
         else:
             self.D = nn.Parameter(torch.ones(n_heads))
 
-        self.out_proj = nn.Linear(self.hidden_dim, self.dim, bias=False)
+        self.out_proj = nn.Linear(self.hidden_dim, self.odim, bias=False)
 
         self.ssm_norm = RMSNorm(self.hidden_dim, eps=1e-5)
 
@@ -396,10 +400,34 @@ class AttambaBlock(nn.Module):
 
         assert args.n_heads % self.n_kv_heads == 0
         assert args.dim % args.n_heads == 0
-
         
+        if args.sep_ssm:
+            odim = args.kvssm_dim
+            self.v_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
+            self.v_ssm = SSM(
+            dim=args.kvssm_dim,
+            odim=args.kvssm_dim,
+            hidden_dim=args.ssm_hiddim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+            state_dim=args.state_dim,
+            n_heads=args.ssm_heads,
+            n_groups=args.n_groups,
+            conv_size=args.conv_size,
+            dt_bias=args.dt_bias,
+            D_has_head_dim=args.D_has_head_dim,
+            learnable_init_states=args.learnable_init_states,
+            chunk_size=args.ssm_chunk_size,
+        )
+        else:
+            odim = args.dim
+            self.v_ssmnorm = None
+            self.v_ssm = None
+        
+        self.k_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
         self.k_ssm = SSM(
             dim=args.kvssm_dim,
+            odim=args.kvssm_dim,
             hidden_dim=args.ssm_hiddim,
             multiple_of=args.multiple_of,
             ffn_dim_multiplier=args.ffn_dim_multiplier,
@@ -413,19 +441,21 @@ class AttambaBlock(nn.Module):
             chunk_size=args.ssm_chunk_size,
         )
 
-        self.k_ssmnorm = RMSNorm(args.kvssm_dim, args.norm_eps)
         
         self.attentive_ssm = AttentiveSSM(
             dim=args.dim,
             head_dim=args.head_dim,
-            n_heads=args.n_heads,
-            n_kv_heads=args.n_groups,
+            n_heads=self.n_heads,
+            n_kv_heads=self.n_kv_heads,
             token_chunk=args.token_chunk,
             rope_theta=args.init_args.dt_max,
             k_ssm=self.k_ssm,
             k_ssmnorm=self.k_ssmnorm,
+            v_ssm=self.v_ssm,
+            v_ssmnorm=self.v_ssmnorm,
             chunk_size=args.ssm_chunk_size,
             residual_ssm=args.residual_ssm,
+            pseudo_chunk=args.pseudo_chunk,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -462,10 +492,16 @@ class AttambaBlock(nn.Module):
     def init_weights(self, init_std=None, factor=1.0, init_args: InitArgs = InitArgs()):
         # self.ssm_norm.reset_parameters()
         self.k_ssm.reset_parameters(init_std, factor, init_args)
-        
+        if self.v_ssm is not None:
+            self.v_ssm.reset_parameters(init_std, factor, init_args)
+
         self.k_ssmnorm.reset_parameters()
+        if self.v_ssmnorm is not None:
+            self.v_ssmnorm.reset_parameters()
 
         self.k_ssm.ssm_norm.reset_parameters()
+        if self.v_ssm is not None:
+            self.v_ssm.ssm_norm.reset_parameters()
 
         self.attention_norm.reset_parameters()
         self.attentive_ssm.reset_parameters(init_std, factor)
