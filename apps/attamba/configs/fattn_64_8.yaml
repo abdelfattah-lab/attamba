@@ -2,8 +2,8 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/debugdump/postkv_8_ssmchunkng"
-name: "postkv_8_ssmchunkng"
+dump_dir: "/scratch/ya255/lingua/debugdump/fattn_a64_16"
+name: "fattn_a64_16"
 
 steps: 30_000
 probe_freq: null
@@ -26,15 +26,15 @@ distributed:
 
 model:
     dim: 256
-    token_chunk: 8
+    token_chunk: 16
     pseudo_chunk: false
     head_dim: 32
     n_layers: 8
     n_heads: 8
     
     # ssm params
-    keep_sink: true 
-    chunk_strat: first_ssm # random, uniform, first_attention [todo: first_ssm: would work because of residual]
+    keep_sink: false
+    chunk_strat: first_attention # random, uniform, first_attention [todo: first_ssm: would work because of residual]
     additional_tokens: 64
     kvssm_dim: 256
     state_dim: 256
@@ -58,9 +58,7 @@ model:
 
 data:
     root_dir: /scratch/ya255/lingua/finewebdata/
-    # root_dir: /scratch/ya255/lingua/data/
     sources:
-        # dclm_baseline_1.0_shuffled: 1.0
         fineweb_edu_10bt_shuffled: 100.0
     batch_size: 8
     prefetch_size: 1024
@@ -85,13 +83,13 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 20000
+        every: 1000
         keep: -1
 
 logging:
     freq: 10
     wandb:
-        project: "attamba_prepost_kv"   
+        project: "attamba_selection"   
 
 eval:
     generator:
@@ -103,12 +101,9 @@ eval:
     harness:
         limit: 200
         tasks:
-            # - wikitext
+            - wikitext
             - piqa
-            - winogrande
-            - arc_easy
-            - gsm8k
-            - openbookqa
-
-            # - task: nq_open
-            #   num_fewshot: 5
+            # - winogrande
+            # - arc_easy
+            # - gsm8k
+            # - openbookqa

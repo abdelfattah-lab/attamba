@@ -439,7 +439,7 @@ class AttentiveSSM(nn.Module):
                     # Uniform boundaries
                     boundaries_b = list(range(K -1, seq_len, K))
                     # Add boundaries to split important chunks
-                    topk_indices_b = self.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
+                    topk_indices_b = self.producer.attentive_ssm.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
                     additional_boundaries = []
                     for c in topk_indices_b:
                         c = c.item()
