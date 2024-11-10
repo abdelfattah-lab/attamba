@@ -338,24 +338,7 @@ class AttentiveSSM(nn.Module):
         self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
         
-    def process_chunks_with_ssm(self, x, ssm_module, tok_idx=None, cu_seqlens=None):
-        bsz, seq_len, edim = x.shape
-        K = self.token_chunk
-        num_chunks = (seq_len + K - 1) // K
-        pad_len = num_chunks * K - seq_len
-        if pad_len > 0:
-            x = F.pad(x, (0, 0, 0, pad_len, 0, 0)).contiguous()
-
-        x = x.view(bsz * num_chunks, K, edim)
-        if hasattr(ssm_module, "cache"):
-            del ssm_module.cache
-        # ssm_outputs = ssm_module(x, tok_idx=tok_idx, cu_seqlens=cu_seqlens, ssm_impl="ssm")
-        ssm_outputs = ssm_module(x, tok_idx=None, cu_seqlens=None, ssm_impl="ssm")
-        ssm_outputs = ssm_outputs.view(bsz, num_chunks * K, edim)
-        ssm_outputs = ssm_outputs[:, :seq_len, :]
-        return ssm_outputs
-
-    def flat_process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
         bsz, seq_len, edim = x.shape
         device = x.device
         total_tokens = bsz * seq_len
@@ -395,8 +378,6 @@ class AttentiveSSM(nn.Module):
         xk = self.wk(x)
         xv = self.wv(x)
 
-
-        # Boundaries are very important, currently, they are uniform.
         boundaries_list = list(range(K - 1, seq_len, K))
         if boundaries_list and boundaries_list[-1] != seq_len - 1:
             boundaries_list.append(seq_len - 1)  # Ensure the last token is included
@@ -423,8 +404,8 @@ class AttentiveSSM(nn.Module):
         cu_seqlens = cu_seqlens.to(torch.int32)  # Shape: (total_sequences + 1,)
         tok_idx = tok_idx.to(torch.int32).unsqueeze(0)  # Shape: (1, total_tokens)
 
-        xk_processed = self.flat_process_chunks_with_ssm(xk, self.k_ssm, tok_idx, cu_seqlens)
-        xv_processed = self.flat_process_chunks_with_ssm(xv, self.v_ssm, tok_idx, cu_seqlens)
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, tok_idx, cu_seqlens)
 
         if self.residual_ssm:
             xk_processed = xk_processed + xk
@@ -454,7 +435,6 @@ class AttentiveSSM(nn.Module):
             else:
                 boundaries = torch.tensor(boundaries_list, device=device)
                 is_chunk_boundary[:, boundaries] = True
-
             t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
             k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
             is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [bsz, 1, seq_len]
