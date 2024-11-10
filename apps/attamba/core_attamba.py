@@ -55,6 +55,7 @@ class BaseAttambaArgs:
     kv_pressm: bool = False
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
+    keep_sink: bool = True
 
     norm_eps: float = 1e-5
 
@@ -325,6 +326,9 @@ class SSM(nn.Module):
         else:
             raise NotImplementedError(f"SSM implementation {ssm_impl} not supported")
 
+        # if y is tuple, keep only [0]
+        if isinstance(y, tuple):
+            y = y[0]
         y = y.view(bsz, seq_len, self.hidden_dim)
 
         # Could be different activation function, including None, Attamba people post_norm here also (sometime norm(z)*y or norm(z*y))
@@ -458,6 +462,7 @@ class AttambaBlock(nn.Module):
             chunk_size=args.ssm_chunk_size,
             residual_ssm=args.residual_ssm,
             pseudo_chunk=args.pseudo_chunk,
+            keep_sink=args.keep_sink,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
