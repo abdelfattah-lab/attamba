@@ -355,50 +355,19 @@ class AttentiveSSM(nn.Module):
         ssm_outputs = ssm_outputs[:, :seq_len, :]
         return ssm_outputs
 
-    def flat_process_chunks_with_ssm(self, x, ssm_module, boundaries_list):
+    def flat_process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
         bsz, seq_len, edim = x.shape
         device = x.device
-        # Flatten x to (1, total_tokens, edim)
         total_tokens = bsz * seq_len
         x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
-        # Positions tensor
-        positions = torch.arange(total_tokens, device=device)  # Shape: (total_tokens,)
-        # Adjust boundaries for each batch item
-        boundaries = torch.tensor(boundaries_list, device=device)  # Shape: (num_sequences_per_batch,)
-        num_sequences_per_batch = len(boundaries)
-        total_boundaries = []
-        for b in range(bsz):
-            batch_boundaries = boundaries + b * seq_len
-            total_boundaries.append(batch_boundaries)
-        total_boundaries = torch.cat(total_boundaries)  # Shape: (bsz * num_sequences_per_batch,)
-        total_boundaries, _ = torch.sort(total_boundaries)
-        # Compute sequence starts and lengths
-        sequence_starts = torch.cat([torch.tensor([0], device=device), total_boundaries[:-1] + 1])
-        sequence_lengths = total_boundaries - sequence_starts + 1  # Shape: (total_sequences,)
-        # Compute sequence IDs for each position
-        sequence_ids = torch.bucketize(positions, total_boundaries)  # Shape: (total_tokens,)
-        # Compute tok_idx for each token
-        sequence_starts_for_positions = sequence_starts[sequence_ids]
-        tok_idx = positions - sequence_starts_for_positions  # Shape: (total_tokens,)
-        # Compute cu_seqlens
-        cu_seqlens = torch.cat([torch.tensor([0], device=device), torch.cumsum(sequence_lengths, dim=0)])
-        cu_seqlens = cu_seqlens.to(torch.int32)  # Shape: (total_sequences + 1,)
-        # Prepare tok_idx
-        tok_idx = tok_idx.to(torch.int32).unsqueeze(0)  # Shape: (1, total_tokens)
-        # Pass through the SSM module
         if hasattr(ssm_module, "cache"):
             del ssm_module.cache
-        try:
-            ssm_outputs = ssm_module(
-                x_flat,          
-                tok_idx=tok_idx, 
-                cu_seqlens=cu_seqlens,
-                ssm_impl="ssm"
-            )  # Output shape: (1, total_tokens, edim)
-        except:
-            import traceback
-            traceback.print_exc()
-        # Reshape back to (bsz, seq_len, edim)
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
         ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
         return ssm_outputs
 
@@ -425,16 +394,42 @@ class AttentiveSSM(nn.Module):
 
         xk = self.wk(x)
         xv = self.wv(x)
+
+
+        # Boundaries are very important, currently, they are uniform.
         boundaries_list = list(range(K - 1, seq_len, K))
         if boundaries_list and boundaries_list[-1] != seq_len - 1:
             boundaries_list.append(seq_len - 1)  # Ensure the last token is included
-        xk_processed = self.flat_process_chunks_with_ssm(xk, self.k_ssm, boundaries_list)
-        xv_processed = self.flat_process_chunks_with_ssm(xv, self.v_ssm, boundaries_list)
-        # xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
-        # xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
+        
+        total_tokens = bsz * seq_len
+
+        positions = torch.arange(total_tokens, device=device)  # Shape: (total_tokens,)
+        boundaries = torch.tensor(boundaries_list, device=device)  # Shape: (num_sequences_per_batch,)
+
+        num_sequences_per_batch = len(boundaries)
+        total_boundaries = []
+        for b in range(bsz):
+            batch_boundaries = boundaries + b * seq_len
+            total_boundaries.append(batch_boundaries)
+
+        total_boundaries = torch.cat(total_boundaries)  # Shape: (bsz * num_sequences_per_batch,)
+        total_boundaries, _ = torch.sort(total_boundaries)
+        sequence_starts = torch.cat([torch.tensor([0], device=device), total_boundaries[:-1] + 1])
+        sequence_lengths = total_boundaries - sequence_starts + 1  # Shape: (total_sequences,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # Shape: (total_tokens,)
+        sequence_starts_for_positions = sequence_starts[sequence_ids]
+        tok_idx = positions - sequence_starts_for_positions  # Shape: (total_tokens,)
+        cu_seqlens = torch.cat([torch.tensor([0], device=device), torch.cumsum(sequence_lengths, dim=0)])
+        cu_seqlens = cu_seqlens.to(torch.int32)  # Shape: (total_sequences + 1,)
+        tok_idx = tok_idx.to(torch.int32).unsqueeze(0)  # Shape: (1, total_tokens)
+
+        xk_processed = self.flat_process_chunks_with_ssm(xk, self.k_ssm, tok_idx, cu_seqlens)
+        xv_processed = self.flat_process_chunks_with_ssm(xv, self.v_ssm, tok_idx, cu_seqlens)
+
         if self.residual_ssm:
             xk_processed = xk_processed + xk
             xv_processed = xv_processed + xv
+
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
         xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
@@ -451,18 +446,24 @@ class AttentiveSSM(nn.Module):
             attn_mask = "causal"
             causality_mask = True
         else:
-            chunk_boundaries = torch.arange(K - 1, L_k, K, device=device)  # Positions K-1, 2K-1, 3K-1, ...
-            is_chunk_boundary = torch.zeros(L_k, dtype=torch.bool, device=device)
-            is_chunk_boundary[chunk_boundaries] = True
-            t_abs = torch.arange(L_q, device=device) + (L_k - L_q)  # [L_q]
-            t_abs = t_abs.unsqueeze(1)  # [L_q, 1]
-            k_abs = torch.arange(L_k, device=device).unsqueeze(0)  # [1, L_k]
-            mask_condition = ((k_abs < t_abs) & is_chunk_boundary.unsqueeze(0)) | (k_abs == (t_abs - 1))  # [L_q, L_k]
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            if isinstance(boundaries_list[0], list):
+                for b in range(bsz):
+                    boundaries_b = boundaries_list[b]
+                    is_chunk_boundary[b, boundaries_b] = True
+            else:
+                boundaries = torch.tensor(boundaries_list, device=device)
+                is_chunk_boundary[:, boundaries] = True
+
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [bsz, 1, seq_len]
+            mask_condition = ((k_abs < t_abs) & is_chunk_boundary_k) | (k_abs == t_abs - 1)
             if self.keep_sink:
                 additional_mask = (k_abs < 4) & (k_abs <= t_abs)
                 mask_condition |= additional_mask
-
-            attn_mask = mask_condition.unsqueeze(0).unsqueeze(0).expand(bsz, n_heads, -1, -1)  # [B, H, L_q, L_k]
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
             causality_mask = False
             attn_mask = attn_mask.contiguous()
 
