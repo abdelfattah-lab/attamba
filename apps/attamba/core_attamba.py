@@ -46,13 +46,13 @@ class BaseAttambaArgs:
 
     dim: int = 512
     pseudo_chunk: bool = False
-    sep_ssm: bool = False
+    sep_ssm: bool = True # Deprecated, always True
     ssm_hiddim: int = 512
     kvssm_dim: int = 32
     n_layers: int = 8
     n_heads: int = 8
     token_chunk: int = 32
-    kv_pressm: bool = False
+    kv_pressm: bool = False # Deprecated, always False
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
     keep_sink: bool = True
