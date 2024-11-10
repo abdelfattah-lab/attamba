@@ -34,7 +34,7 @@ model:
     
     # ssm params
     keep_sink: false
-    chunk_strat: uniform # random, uniform, first_attention [todo: first_ssm: would work because of residual]
+    chunk_strat: first_ssm # random, uniform, first_attention [todo: first_ssm: would work because of residual]
     additional_tokens: 64
     kvssm_dim: 256
     state_dim: 256
@@ -83,7 +83,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 1000
+        every: 50000
         keep: -1
 
 logging:
@@ -102,7 +102,7 @@ eval:
         limit: 200
         tasks:
             - wikitext
-            - piqa
+            # - piqa
             # - winogrande
             # - arc_easy
             # - gsm8k

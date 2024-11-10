@@ -2,8 +2,8 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/debugdump/fssm_a64_16"
-name: "fssm_a64_16"
+dump_dir: "/scratch/ya255/lingua/debugdump/unif_a64_16"
+name: "unif_a64_16"
 
 steps: 30_000
 probe_freq: null
@@ -83,7 +83,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 1000
+        every: 50000
         keep: -1
 
 logging:
@@ -102,7 +102,7 @@ eval:
         limit: 200
         tasks:
             - wikitext
-            - piqa
+            # - piqa
             # - winogrande
             # - arc_easy
             # - gsm8k

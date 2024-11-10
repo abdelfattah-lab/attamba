@@ -58,7 +58,7 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 1000
+        every: 50000
         keep: -1
         
 logging:
@@ -76,7 +76,7 @@ eval:
         limit: 200
         tasks:
             - wikitext
-            - piqa
+            # - piqa
             # - arc_easy
             # - gsm8k
             # - wikitext

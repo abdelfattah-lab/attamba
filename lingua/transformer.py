@@ -392,7 +392,7 @@ class AttentiveSSM(nn.Module):
         xk = self.wk(x)
         xv = self.wv(x)
         
-        if self.eval_imp and self.chunk_strat == "first_transformer":
+        if self.eval_imp and self.chunk_strat == "first_attention":
             xq = xq.view(bsz, seq_len, n_heads, head_dim)
             xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
             xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
