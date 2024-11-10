@@ -422,57 +422,25 @@ class AttentiveSSM(nn.Module):
         K = self.token_chunk
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
-        if self.kv_pressm:
-            xk = self.wk(x)
-            xv = self.wv(x)
-            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-            xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
-            xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
 
-            xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis)
-            if hasattr(self, "kv_cache"):
-                xk, xv = self.kv_cache.update(xk, xv, tok_idx)
-
-            xk = xk.view(bsz, -1, n_kv_heads * head_dim)
-            xv = xv.view(bsz, -1, n_kv_heads * head_dim)
-
-            if self.v_ssm is None:
-                raise NotImplementedError("Double-Pump SSMs mandatory for Pre-SSM KV-Cache")
-            else:
-                xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
-                xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
-                if self.residual_ssm:
-                    xk_processed = xk_processed + xk
-                    xv_processed = xv_processed + xv
-
-            xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
-            xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
-        else:
-            if self.v_ssm is None:
-                x_processed = self.process_chunks_with_ssm(self.k_ssmnorm(x), self.k_ssm)
-                if self.residual_ssm:
-                    x_processed = x_processed + x
-                xk_processed = self.wk(x_processed)
-                xv_processed = self.wv(x_processed)
-            else:
-                xk = self.wk(x)
-                xv = self.wv(x)
-                boundaries_list = list(range(K - 1, seq_len, K))
-                if boundaries_list and boundaries_list[-1] != seq_len - 1:
-                    boundaries_list.append(seq_len - 1)  # Ensure the last token is included
-                xk_processed = self.flat_process_chunks_with_ssm(xk, self.k_ssm, boundaries_list)
-                xv_processed = self.flat_process_chunks_with_ssm(xv, self.v_ssm, boundaries_list)
-                # xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
-                # xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
-                if self.residual_ssm:
-                    xk_processed = xk_processed + xk
-                    xv_processed = xv_processed + xv
-            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-            xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
-            if hasattr(self, "kv_cache"):
-                xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+        xk = self.wk(x)
+        xv = self.wv(x)
+        boundaries_list = list(range(K - 1, seq_len, K))
+        if boundaries_list and boundaries_list[-1] != seq_len - 1:
+            boundaries_list.append(seq_len - 1)  # Ensure the last token is included
+        xk_processed = self.flat_process_chunks_with_ssm(xk, self.k_ssm, boundaries_list)
+        xv_processed = self.flat_process_chunks_with_ssm(xv, self.v_ssm, boundaries_list)
+        # xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm)
+        # xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm)
+        if self.residual_ssm:
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
 
         L_k = xk_processed.size(1)
 

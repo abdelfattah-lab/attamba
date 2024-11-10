@@ -1,0 +1,112 @@
+# Template config, need to change dump_dir, data.root_dir and tokenizer.path
+# Evals can be activated by uncommenting its config
+# python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
+
+dump_dir: "/scratch/ya255/lingua/debugdump/postkv_8_wsink_v2"
+name: "postkv_8_wsink_v2"
+
+steps: 30_000
+probe_freq: null
+seed: 777
+
+optim:
+  lr: 3e-3
+  weight_decay: 0.033
+  warmup: 2000
+  lr_min_ratio: 0.000001
+  clip: 1.0
+
+distributed:
+    fsdp_type: full_shard
+    compile: true
+    model_dtype: bf16
+    matmul_allow_tf32: false
+    selective_activation_checkpointing: true
+    tp_size: 1
+
+model:
+    dim: 256
+    token_chunk: 8
+    pseudo_chunk: false
+    head_dim: 32
+    n_layers: 8
+    n_heads: 8
+    
+    # ssm params
+    keep_sink: true 
+    kv_pressm: false # DEPRECATED, FALSE DEFAULT
+    sep_ssm: true # DEPRECATED, TRUE DEFAULT
+    kvssm_dim: 256
+    state_dim: 256
+    ssm_chunk_size: 32  # Should be same as token_chunk ?
+    n_groups: 1
+    residual_ssm: true
+    ssm_hiddim: 256         # hidden_dim  -- [MATCH (?) dim]
+    learnable_init_states: false
+    ssm_heads: 8
+    # null
+    conv_size: 4
+
+    dt_bias: false
+    D_has_head_dim: false
+    init_args:
+        A_init_min: 0.01
+        A_init_max: 2
+
+
+data:
+    root_dir: /scratch/ya255/lingua/finewebdata/
+    # root_dir: /scratch/ya255/lingua/data/
+    sources:
+        # dclm_baseline_1.0_shuffled: 1.0
+        fineweb_edu_10bt_shuffled: 100.0
+    batch_size: 8
+    prefetch_size: 1024
+    seq_len: 4096
+    n_views: 2
+    load_async: true
+    add_bos: true
+    add_eos: true
+    tokenizer:
+        name: sp
+        path: setup/l2tokenizer/tokenizer.model
+
+profiling:
+  run: true
+  mem_warmup: 0
+  mem_steps: 4
+  profile_warmup: 100
+  profile_steps: 4
+
+checkpoint:
+    dump:
+        every: 10000
+        keep: 3
+    eval:
+        every: 20000
+        keep: -1
+
+logging:
+    freq: 10
+    # wandb:
+    #     project: "attamba_prepost_kv"   
+
+eval:
+    generator:
+        # max_tokens: 8192
+        max_tokens: 1024
+        dtype: bf16
+        # temperature: 1.0
+        # top_p: 0.95
+    harness:
+        limit: 200
+        tasks:
+            # - wikitext
+            - piqa
+            - winogrande
+            - arc_easy
+            - gsm8k
+            - openbookqa
+
+            # - task: nq_open
+            #   num_fewshot: 5
