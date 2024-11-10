@@ -56,6 +56,7 @@ class BaseAttambaArgs:
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
     keep_sink: bool = True
+    chunk_strat: str = "uniform"
 
     norm_eps: float = 1e-5
 
@@ -393,7 +394,7 @@ class SSM(nn.Module):
 
 
 class AttambaBlock(nn.Module):
-    def __init__(self, args: BaseAttambaArgs):
+    def __init__(self, args: BaseAttambaArgs, producer: None):
         super().__init__()
 
         assert (args.head_dim is not None) or (
@@ -463,6 +464,8 @@ class AttambaBlock(nn.Module):
             residual_ssm=args.residual_ssm,
             pseudo_chunk=args.pseudo_chunk,
             keep_sink=args.keep_sink,
+            chunk_strat=args.chunk_strat,
+            producer=producer,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -536,8 +539,11 @@ class BaseAttamba(nn.Module):
         )
 
         self.layers = nn.ModuleList()
-        for _ in range(args.n_layers):
-            self.layers.append(AttambaBlock(args))
+        for lidx in range(args.n_layers):
+            if lidx > 0:
+                self.layers.append(AttambaBlock(args, producer=self.layers[0]))
+            else:
+                self.layers.append(AttambaBlock(args, producer=None))
 
     def forward(
         self,
