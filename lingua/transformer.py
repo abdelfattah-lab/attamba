@@ -313,6 +313,7 @@ class AttentiveSSM(nn.Module):
         keep_sink: bool = True,
         chunk_strat: str = "uniform",
         producer = None,
+        additional_tokens=64,
     ):
         super().__init__()
         
@@ -331,11 +332,11 @@ class AttentiveSSM(nn.Module):
         self.kv_pressm = kv_pressm
         self.keep_sink = keep_sink
         self.chunk_strat = chunk_strat
+        self.additional_tokens = additional_tokens
         # If chunk_strat is first_attention and producer is None
         # then this later is the producer layer, we need to set
         # token ordering boundaries in rest of the layers appropriately
-        if producer != None:
-            self.producer = producer
+        self.producer = producer
 
         if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
             self.eval_imp = True
@@ -391,7 +392,7 @@ class AttentiveSSM(nn.Module):
         xk = self.wk(x)
         xv = self.wv(x)
         
-        if self.eval_imp:
+        if self.eval_imp and self.chunk_strat == "first_transformer":
             xq = xq.view(bsz, seq_len, n_heads, head_dim)
             xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
             xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
@@ -403,9 +404,8 @@ class AttentiveSSM(nn.Module):
             scores = scores / (xq.size(-1) ** 0.5)
             attn_weights = torch.softmax(scores.squeeze(), dim=-1)
             # self.topk_indices = torch.topk(attn_weights, int(0.1 * attn_weights.size(-1)), dim=-1)[1]
-            self.topk_indices = torch.topk(attn_weights, 64, dim=-1)[1]
+            self.topk_indices = torch.topk(attn_weights, self.additional_tokens, dim=-1)[1]
             del scores
-
             attn_mask = "causal"
             causality_mask = True
         else:
@@ -431,6 +431,31 @@ class AttentiveSSM(nn.Module):
                     if boundaries_b and boundaries_b[-1] != seq_len - 1:
                         boundaries_b.append(seq_len - 1)
                     boundaries_list.append(boundaries_b)
+            elif self.chunk_strat == "first_ssm" and self.producer is not None:
+                # this is not the ssm, do uniform chunking and then split based on self.producer.topk_indices
+                # Here, topk_indices refer to indices of chunks to split in half, using idx of boundaries_list
+                boundaries_list = []
+                for b in range(bsz):
+                    # Uniform boundaries
+                    boundaries_b = list(range(K -1, seq_len, K))
+                    # Add boundaries to split important chunks
+                    topk_indices_b = self.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
+                    additional_boundaries = []
+                    for c in topk_indices_b:
+                        c = c.item()
+                        # Existing boundary for chunk c
+                        boundary = (c +1) * K -1  # Position of the chunk's end
+                        # Insert a new boundary to split the chunk into two
+                        new_boundary = c * K + (K//2)  # Split at middle
+                        if 0 <= new_boundary < seq_len:
+                            additional_boundaries.append(new_boundary)
+                    boundaries_b = sorted(set(boundaries_b + additional_boundaries))
+                    if boundaries_b and boundaries_b[-1] != seq_len -1:
+                        boundaries_b.append(seq_len -1)
+                    boundaries_list.append(boundaries_b)
+            elif self.chunk_strat == "first_ssm" and self.producer is None:
+                # this is the first ssm, do uniform chunking
+                boundaries_list = list(range(K - 1, seq_len, K))
             elif self.chunk_strat == "uniform":
                 boundaries_list = list(range(K - 1, seq_len, K))
             else:
@@ -439,8 +464,14 @@ class AttentiveSSM(nn.Module):
             if self.chunk_strat not in ["first_attention", "first_ssm"]:
                 boundaries_list = [boundaries_list for _ in range(bsz)]
     
+            if self.chunk_strat == "first_ssm" and self.producer is None:
+                boundaries_list = [boundaries_list for _ in range(bsz)]
+
             if self.chunk_strat in ["first_attention", "first_ssm"]:
-                pass
+                if self.chunk_strat == "first_ssm" and self.producer is None:
+                    boundaries_list = [bl for bl in boundaries_list]
+                else:    
+                    pass
             else:
                 boundaries_list = [bl for bl in boundaries_list]
 
@@ -532,6 +563,20 @@ class AttentiveSSM(nn.Module):
                 causality_mask = False
 
             xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+            if self.chunk_strat == "first_ssm" and self.producer is None:
+                scores = torch.bmm(xq[:, 0, :, :], xk_processed[:, 0, -1, :].unsqueeze(1).transpose(1, 2))
+                scores = scores / (xq.size(-1) ** 0.5)
+                chunkmask = attn_mask[:, 0, -1, :]
+                if self.keep_sink:
+                    # undo sink behavior to correctly get chunks...
+                    chunkmask[:, :4] = False
+                scores[~chunkmask] = float("-inf")
+                attn_weights = torch.softmax(scores.squeeze(), dim=-1)
+                non_zero_columns = torch.any(attn_weights != 0, dim=0)
+                attn_weights_filtered = attn_weights[:, non_zero_columns]
+                self.topk_indices = torch.sort(attn_weights_filtered, descending=True, dim=-1)[1]
+
             
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         output = F.scaled_dot_product_attention(

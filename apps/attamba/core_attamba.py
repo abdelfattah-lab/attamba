@@ -57,6 +57,7 @@ class BaseAttambaArgs:
     head_dim: Optional[int] = None
     keep_sink: bool = True
     chunk_strat: str = "uniform"
+    additional_tokens: int = 64
 
     norm_eps: float = 1e-5
 
@@ -466,6 +467,7 @@ class AttambaBlock(nn.Module):
             keep_sink=args.keep_sink,
             chunk_strat=args.chunk_strat,
             producer=producer,
+            additional_tokens=args.additional_tokens,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
