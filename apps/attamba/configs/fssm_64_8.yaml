@@ -2,8 +2,8 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/debugdump/fssm_a64_16"
-name: "fssm_a64_16"
+dump_dir: "/scratch/ya255/lingua/custom_runs/cyclic_pl_8_noproj"
+name: "cyclic_pl_8_noproj"
 
 steps: 30_000
 probe_freq: null
@@ -26,7 +26,7 @@ distributed:
 
 model:
     dim: 256
-    token_chunk: 16
+    token_chunk: 8
     pseudo_chunk: false
     head_dim: 32
     n_layers: 8
@@ -34,7 +34,8 @@ model:
     
     # ssm params
     keep_sink: false
-    chunk_strat: first_ssm # random, uniform, first_attention [todo: first_ssm: would work because of residual]
+    keep_wproj: false
+    chunk_strat: cyclic_pl # random, uniform, first_attention [todo: first_ssm: would work because of residual]
     additional_tokens: 64
     kvssm_dim: 256
     state_dim: 256
@@ -83,13 +84,13 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 50000
+        every: 5000
         keep: -1
 
 logging:
     freq: 10
     wandb:
-        project: "attamba_selection"   
+        project: "attamba_fixed"   
 
 eval:
     generator:
@@ -99,7 +100,7 @@ eval:
         # temperature: 1.0
         # top_p: 0.95
     harness:
-        limit: 200
+        limit: 400
         tasks:
             - wikitext
             # - piqa

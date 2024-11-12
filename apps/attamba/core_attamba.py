@@ -47,6 +47,7 @@ class BaseAttambaArgs:
     dim: int = 512
     pseudo_chunk: bool = False
     sep_ssm: bool = True # Deprecated, always True
+    keep_wproj: bool = True
     ssm_hiddim: int = 512
     kvssm_dim: int = 32
     n_layers: int = 8
@@ -395,7 +396,7 @@ class SSM(nn.Module):
 
 
 class AttambaBlock(nn.Module):
-    def __init__(self, args: BaseAttambaArgs, producer: None):
+    def __init__(self, args: BaseAttambaArgs, layer_idx: None, producer: None):
         super().__init__()
 
         assert (args.head_dim is not None) or (
@@ -468,6 +469,9 @@ class AttambaBlock(nn.Module):
             chunk_strat=args.chunk_strat,
             producer=producer,
             additional_tokens=args.additional_tokens,
+            layer_idx=layer_idx,
+            nlayers=args.n_layers,
+            keep_wproj=args.keep_wproj,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -543,9 +547,9 @@ class BaseAttamba(nn.Module):
         self.layers = nn.ModuleList()
         for lidx in range(args.n_layers):
             if lidx > 0:
-                self.layers.append(AttambaBlock(args, producer=self.layers[0]))
+                self.layers.append(AttambaBlock(args, layer_idx=lidx, producer=self.layers[0]))
             else:
-                self.layers.append(AttambaBlock(args, producer=None))
+                self.layers.append(AttambaBlock(args, layer_idx=lidx, producer=None))
 
     def forward(
         self,

@@ -314,6 +314,9 @@ class AttentiveSSM(nn.Module):
         chunk_strat: str = "uniform",
         producer = None,
         additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
     ):
         super().__init__()
         
@@ -332,11 +335,19 @@ class AttentiveSSM(nn.Module):
         self.kv_pressm = kv_pressm
         self.keep_sink = keep_sink
         self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
         self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
         # If chunk_strat is first_attention and producer is None
         # then this later is the producer layer, we need to set
         # token ordering boundaries in rest of the layers appropriately
         self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
 
         if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
             self.eval_imp = True
@@ -389,8 +400,12 @@ class AttentiveSSM(nn.Module):
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
 
-        xk = self.wk(x)
-        xv = self.wv(x)
+        if self.keep_wproj:
+            xk = self.wk(x)
+            xv = self.wv(x)
+        else:
+            xk = x
+            xv = x
         
         if self.eval_imp and self.chunk_strat == "first_attention":
             xq = xq.view(bsz, seq_len, n_heads, head_dim)
@@ -411,11 +426,19 @@ class AttentiveSSM(nn.Module):
         else:
             if self.chunk_strat == "random":
                 boundaries_list = torch.randperm(seq_len)[:seq_len // K].sort().values.tolist()
+                if boundaries_list and boundaries_list[-1] != seq_len -1:
+                    boundaries_list.append(seq_len -1)
+                if boundaries_list and boundaries_list[0] != 0:
+                    boundaries_list.insert(0, 0)
             elif self.chunk_strat == "first_attention":
                 boundaries_list = []
                 for b in range(bsz):
                     # Uniform boundaries
                     boundaries_b = list(range(K - 1, seq_len, K))
+                    if boundaries_b and boundaries_b[-1] != seq_len -1:
+                        boundaries_b.append(seq_len -1)
+                    if boundaries_b and boundaries_b[0] != 0:
+                        boundaries_b.insert(0, 0)
                     # Add boundaries around topk_indices
                     topk_indices_b = self.producer.attentive_ssm.topk_indices[b]  # Shape: [64]
                     additional_boundaries = []
@@ -438,6 +461,10 @@ class AttentiveSSM(nn.Module):
                 for b in range(bsz):
                     # Uniform boundaries
                     boundaries_b = list(range(K -1, seq_len, K))
+                    if boundaries_b and boundaries_b[-1] != seq_len -1:
+                        boundaries_b.append(seq_len -1)
+                    if boundaries_b and boundaries_b[0] != 0:
+                        boundaries_b.insert(0, 0)
                     # Add boundaries to split important chunks
                     topk_indices_b = self.producer.attentive_ssm.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
                     additional_boundaries = []
@@ -456,8 +483,26 @@ class AttentiveSSM(nn.Module):
             elif self.chunk_strat == "first_ssm" and self.producer is None:
                 # this is the first ssm, do uniform chunking
                 boundaries_list = list(range(K - 1, seq_len, K))
+                if boundaries_list and boundaries_list[-1] != seq_len -1:
+                    boundaries_list.append(seq_len -1)
+                if boundaries_list and boundaries_list[0] != 0:
+                    boundaries_list.insert(0, 0)
             elif self.chunk_strat == "uniform":
                 boundaries_list = list(range(K - 1, seq_len, K))
+                if boundaries_list and boundaries_list[-1] != seq_len -1:
+                    boundaries_list.append(seq_len -1)
+                if boundaries_list and boundaries_list[0] != 0:
+                    boundaries_list.insert(0, 0)
+            elif self.chunk_strat == "cyclic_pl":
+                boundaries_list = list(range(K - 1, seq_len, K))
+                # increments of self.layer_idx * (token_chunk // self.n_layers)
+                boundary_offset = int(self.layer_idx * (self.token_chunk // self.nlayers))
+                # boundary_offset = int(layer_idx * (token_chunk // nlayers)) - 1
+                boundaries_list = [b - boundary_offset for b in boundaries_list]
+                if boundaries_list and boundaries_list[-1] != seq_len -1:
+                    boundaries_list.append(seq_len -1)
+                if boundaries_list and boundaries_list[0] != 0:
+                    boundaries_list.insert(0, 0)
             else:
                 raise NotImplementedError(f"Chunk strat {self.chunk_strat} not supported")
 
@@ -510,27 +555,29 @@ class AttentiveSSM(nn.Module):
             sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
             if sequence_starts.numel() > 0:
                 sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
-                tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+                ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
             else:
-                tok_idx = positions  # (total_tokens,)
+                ssm_kv_tok_idx = positions  # (total_tokens,)
             cu_seqlens = torch.cat([
                 torch.tensor([0], device=device, dtype=torch.int32),
                 torch.cumsum(sequence_lengths, dim=0)
             ])  # (total_sequences + 1,)
-            tok_idx = tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+            ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
     
 
-            xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, tok_idx, cu_seqlens)
-            xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, tok_idx, cu_seqlens)
+            xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+            xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
             if self.residual_ssm:
                 xk_processed = xk_processed + xk
                 xv_processed = xv_processed + xv
 
             xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-            xk_processed = xk_processed.view(bsz, seq_len, n_kv_heads, head_dim)
-            xv_processed = xv_processed.view(bsz, seq_len, n_kv_heads, head_dim)
+            xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+            xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
             xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+            
+
             if hasattr(self, "kv_cache"):
                 xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
 
@@ -554,10 +601,11 @@ class AttentiveSSM(nn.Module):
                 t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
                 k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
                 is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
-                mask_condition = ((k_abs < t_abs) & is_chunk_boundary_k) | (k_abs == t_abs - 1)
+                mask_condition = ((k_abs < t_abs) & is_chunk_boundary_k) | (k_abs == t_abs - 1) | (k_abs == t_abs)
                 if self.keep_sink:
                     additional_mask = (k_abs < 4) & (k_abs <= t_abs)
                     mask_condition |= additional_mask
+                
                 attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
                 attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
                 causality_mask = False
@@ -579,13 +627,16 @@ class AttentiveSSM(nn.Module):
 
             
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
-        output = F.scaled_dot_product_attention(
-            xq,
-            xk_processed,
-            xv_processed,
-            attn_mask=attn_mask,
-            is_causal=causality_mask
-        )
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except:
+            import pdb; pdb.set_trace()
         output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
 
         output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
@@ -594,9 +645,7 @@ class AttentiveSSM(nn.Module):
 
     def reset_parameters(self, init_std=None, factor=1.0):
         init_std = init_std or (self.dim ** (-0.5))
-        init_std = init_std / factor
-
-        for w in [self.wq, self.wk, self.wv, self.wo]:
+        for w in [self.wq, self.wk, self.wv]:
             nn.init.trunc_normal_(
                 w.weight,
                 mean=0.0,
@@ -605,6 +654,13 @@ class AttentiveSSM(nn.Module):
                 b=3 * init_std,
             )
 
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
 
 class Attention(nn.Module):
     def __init__(
@@ -714,9 +770,8 @@ class Attention(nn.Module):
 
     def reset_parameters(self, init_std=None, factor=1.0):
         init_std = init_std or (self.dim ** (-0.5))
-        init_std = init_std / factor
 
-        for w in [self.wq, self.wk, self.wv, self.wo]:
+        for w in [self.wq, self.wk, self.wv]:
             nn.init.trunc_normal_(
                 w.weight,
                 mean=0.0,
@@ -725,6 +780,13 @@ class Attention(nn.Module):
                 b=3 * init_std,
             )
 
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
 
 class FeedForward(nn.Module):
     def __init__(
@@ -772,7 +834,7 @@ class FeedForward(nn.Module):
     def reset_parameters(self, init_std=None, factor=1.0):
         in_init_std = init_std or (self.dim ** (-0.5))
         out_init_std = init_std or (self.hidden_dim ** (-0.5))
-        in_init_std = in_init_std / factor
+        in_init_std = in_init_std
         out_init_std = out_init_std / factor
         for w in [self.w1, self.w3]:
             nn.init.trunc_normal_(

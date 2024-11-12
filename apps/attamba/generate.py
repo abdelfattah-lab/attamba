@@ -108,24 +108,29 @@ class KVCache(nn.Module):
         self.register_buffer("k_cache", torch.zeros(shape, dtype=dtype, device=device))
         self.register_buffer("v_cache", torch.zeros(shape, dtype=dtype, device=device))
         self.offset = 0
+        self.current_length = 0
 
     def reset(self):
         self.k_cache.zero_()
         self.v_cache.zero_()
         self.offset = 0
+        self.current_length = 0
 
     def update(self, k_val, v_val, tok_idx):
         try:
             # input_pos: [B], k_val: [B, S, H, D]
             self.k_cache.index_copy_(1, self.offset + tok_idx, k_val)
             self.v_cache.index_copy_(1, self.offset + tok_idx, v_val)
+            self.current_length = max(self.current_length, tok_idx.max().item() + 1)
         except:
             import traceback
             traceback.print_exc()
             import pdb; pdb.set_trace()
 
-        return self.k_cache, self.v_cache
+        # return self.k_cache, self.v_cache
 
+        return (self.k_cache[:, :self.current_length, :, :],
+                self.v_cache[:, :self.current_length, :, :])
 
 @dataclass
 class PackedCausalAttambaGeneratorArgs:
@@ -210,6 +215,7 @@ class PackedCausalAttambaGenerator:
                         self.device,
                     )
                 module.kv_cache.offset = offset
+                module.kv_cache.current_length = 0
 
     @torch.compiler.disable
     def setup_prefilling(self, lengths: torch.Tensor):
@@ -380,7 +386,7 @@ class PackedCausalAttambaGenerator:
             packed_batch, lengths = pack_prompts(batch)
             packed_batch, lengths = packed_batch.cuda(), lengths.cuda()
             n_seqs = lengths.size(0)
-
+            self.clear_cache(0)
             # Prefilling cache
             prompt_logits = self.prefill(packed_batch.unsqueeze(0), lengths)
             # Selecting last token in each prompt

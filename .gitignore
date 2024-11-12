@@ -3,3 +3,9 @@
 *.ipynb
 slurm-*.out
 wandb
+*.jsonl*
+debugd*
+debug_d*
+finewebdata*
+*sample
+.git_backup

@@ -1,13 +1,12 @@
 diff --git a/lm_eval/api/metrics.py b/lm_eval/api/metrics.py
-index a8459aa7..34413d66 100644
+index a8459aa7..3e339db7 100644
 --- a/lm_eval/api/metrics.py
 +++ b/lm_eval/api/metrics.py
-@@ -40,7 +40,12 @@ def perplexity(items):
+@@ -40,7 +40,11 @@ def perplexity(items):
  
  @register_aggregation("weighted_perplexity")
  def weighted_perplexity(items):
 -    return math.exp(-weighted_mean(items))
-+    # return math.exp(-weighted_mean(items))
 +    mean_value = weighted_mean(items)
 +    try:
 +        return math.exp(-mean_value)
@@ -16,22 +15,22 @@ index a8459aa7..34413d66 100644
  
  
  @register_aggregation("bits_per_byte")
-@@ -403,8 +408,13 @@ def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+@@ -400,10 +404,13 @@ def metric_max_over_ground_truths(metric_fn, prediction, ground_truths):
+         scores_for_ground_truths.append(score)
+     return max(scores_for_ground_truths)
  
+-
  def weighted_mean(items):
      a, b = zip(*items)
 -    return sum(a) / sum(b)
--
-+    a = [x[0] if isinstance(x, tuple) else x for x in a]  # Flatten `a`
 +    try:
-+        weighted_sum = sum(x * w for x, w in zip(a, b))
-+        weight_sum = sum(b)
-+        return weighted_sum / weight_sum if weight_sum != 0 else float('inf')
-+    except ZeroDivisionError:
-+        return float('inf')
++        wmean = sum(a) / sum(b)
++    except:
++        wmean = sum([x[0] for x in a]) / sum(b)
++    return wmean
+ 
  
  def is_non_str_iterable(obj):
-     return isinstance(obj, Iterable) and not isinstance(obj, str)
 diff --git a/lm_eval/api/task.py b/lm_eval/api/task.py
 index 532e9e7a..b5feeea5 100644
 --- a/lm_eval/api/task.py
