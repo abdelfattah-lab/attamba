@@ -317,6 +317,7 @@ class AttentiveSSM(nn.Module):
         layer_idx=None,
         nlayers=None,
         keep_wproj=True,
+        fattn_boundary="uniform",
     ):
         super().__init__()
         
@@ -342,6 +343,7 @@ class AttentiveSSM(nn.Module):
             self.get_rotated = False
         self.additional_tokens = additional_tokens
         self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
         # If chunk_strat is first_attention and producer is None
         # then this later is the producer layer, we need to set
         # token ordering boundaries in rest of the layers appropriately
@@ -359,8 +361,9 @@ class AttentiveSSM(nn.Module):
 
         # Projection layers
         self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
-        self.wk = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
-        self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        if self.keep_wproj:
+            self.wk = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+            self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
         
     def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
@@ -400,7 +403,8 @@ class AttentiveSSM(nn.Module):
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
 
-        if self.keep_wproj:
+        if self.keep_wproj and not self.chunk_strat == "first_attention":
+            # if first_attention, we must have projection.
             xk = self.wk(x)
             xv = self.wv(x)
         else:
@@ -415,11 +419,31 @@ class AttentiveSSM(nn.Module):
             xk = repeat_kv(xk, self.heads_per_group, dim=2)
             xv = repeat_kv(xv, self.heads_per_group, dim=2)
             xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk, xv))
-            scores = torch.bmm(xq[:, 0, :, :], xk_processed[:, 0, -1, :].unsqueeze(1).transpose(1, 2))
+            xk_last = xk_processed[:, :, -1, :]
+            xq_reshaped = xq.view(-1, xq.size(-2), xq.size(-1))
+            xk_last_reshaped = xk_last.view(-1, xk_last.size(-1), 1)
+            scores = torch.bmm(xq_reshaped, xk_last_reshaped).view(*xq.shape[:2], xq.size(-2), 1)
+            # scores = torch.bmm(xq[:, 0, :, :], xk_processed[:, 0, -1, :].unsqueeze(1).transpose(1, 2))
             scores = scores / (xq.size(-1) ** 0.5)
             attn_weights = torch.softmax(scores.squeeze(), dim=-1)
             # self.topk_indices = torch.topk(attn_weights, int(0.1 * attn_weights.size(-1)), dim=-1)[1]
-            self.topk_indices = torch.topk(attn_weights, self.additional_tokens, dim=-1)[1]
+            # self.topk_indices = torch.topk(attn_weights, self.additional_tokens // attn_weights.size(1), dim=-1)[1].view(bsz, -1)
+            # Take twice the number of tokens to increase chances of uniqueness
+            extra_topk_indices = torch.topk(attn_weights, 2 * (seq_len // K) // attn_weights.size(1), dim=-1)[1]
+            num_to_keep = self.additional_tokens if self.fattn_boundary == "uniform" else (seq_len // K)
+            self.topk_indices = torch.empty(bsz, num_to_keep, dtype=torch.long, device=attn_weights.device)
+            for i in range(bsz):
+                unique_tokens = torch.unique(extra_topk_indices[i]).tolist()  # Get unique tokens as a list
+                try:
+                    self.topk_indices[i] = torch.tensor(unique_tokens[:num_to_keep], device=attn_weights.device)
+                except:
+                    # take unique_toksn, and for rest use random numbers not in unique_tokens list, between min and max
+                    min_tok = min(unique_tokens)
+                    max_tok = max(unique_tokens)
+                    remaining_tokens = num_to_keep - len(unique_tokens)
+                    range_choices = set(list(range(min_tok, max_tok))) - set(unique_tokens)
+                    random_tokens = torch.tensor(list(range_choices)[:remaining_tokens], device=attn_weights.device)
+                    self.topk_indices[i] = torch.cat([torch.tensor(unique_tokens, device=attn_weights.device), random_tokens])
             del scores
             attn_mask = "causal"
             causality_mask = True
@@ -431,29 +455,45 @@ class AttentiveSSM(nn.Module):
                 if boundaries_list and boundaries_list[0] != 0:
                     boundaries_list.insert(0, 0)
             elif self.chunk_strat == "first_attention":
-                boundaries_list = []
-                for b in range(bsz):
-                    # Uniform boundaries
-                    boundaries_b = list(range(K - 1, seq_len, K))
-                    if boundaries_b and boundaries_b[-1] != seq_len -1:
-                        boundaries_b.append(seq_len -1)
-                    if boundaries_b and boundaries_b[0] != 0:
-                        boundaries_b.insert(0, 0)
-                    # Add boundaries around topk_indices
-                    topk_indices_b = self.producer.attentive_ssm.topk_indices[b]  # Shape: [64]
-                    additional_boundaries = []
-                    for idx in topk_indices_b:
-                        idx = idx.item()
-                        for delta in [-1, 0, 1]:
-                            new_boundary = idx + delta
-                            if 0 <= new_boundary < seq_len:
-                                additional_boundaries.append(new_boundary)
-                    # Combine uniform and additional boundaries
-                    boundaries_b = sorted(set(boundaries_b + additional_boundaries))
-                    # Ensure the last token is included
-                    if boundaries_b and boundaries_b[-1] != seq_len - 1:
-                        boundaries_b.append(seq_len - 1)
-                    boundaries_list.append(boundaries_b)
+                if self.fattn_boundary == "uniform":
+                    boundaries_list = []
+                    for b in range(bsz):
+                        # Uniform boundaries
+                        boundaries_b = list(range(K - 1, seq_len, K))
+                        if boundaries_b and boundaries_b[-1] != seq_len -1:
+                            boundaries_b.append(seq_len -1)
+                        if boundaries_b and boundaries_b[0] != 0:
+                            boundaries_b.insert(0, 0)
+                        # Add boundaries around topk_indices
+                        topk_indices_b = self.producer.attentive_ssm.topk_indices[b]  # Shape: [64]
+                        additional_boundaries = []
+                        for idx in topk_indices_b:
+                            idx = idx.item()
+                            for delta in [-1, 0]:
+                                new_boundary = idx + delta
+                                if 0 <= new_boundary < seq_len:
+                                    additional_boundaries.append(new_boundary)
+                        # Combine uniform and additional boundaries
+                        boundaries_b = sorted(set(boundaries_b + additional_boundaries))
+                        # Ensure the last token is included
+                        if boundaries_b and boundaries_b[-1] != seq_len - 1:
+                            boundaries_b.append(seq_len - 1)
+                        boundaries_list.append(boundaries_b)
+                elif self.fattn_boundary == "breakpoint":
+                    boundaries_list = []
+                    for b in range(bsz):
+                        topk_indices_b = self.producer.attentive_ssm.topk_indices[b]  # Shape: [64]
+                        boundaries_b = torch.unique(topk_indices_b).sort().values.tolist()
+                        if not boundaries_b:
+                            boundaries_b = [0, seq_len - 1]
+                        else:
+                            if boundaries_b[0] != 0:
+                                boundaries_b.insert(0, 0)
+                            if boundaries_b[-1] != seq_len - 1:
+                                boundaries_b.append(seq_len - 1)
+                        boundaries_list.append(boundaries_b)
+                else:
+                    raise NotImplementedError(f"Boundary strategy {self.fattn_boundary} not supported")
             elif self.chunk_strat == "first_ssm" and self.producer is not None:
                 # this is not the ssm, do uniform chunking and then split based on self.producer.topk_indices
                 # Here, topk_indices refer to indices of chunks to split in half, using idx of boundaries_list
@@ -465,21 +505,42 @@ class AttentiveSSM(nn.Module):
                         boundaries_b.append(seq_len -1)
                     if boundaries_b and boundaries_b[0] != 0:
                         boundaries_b.insert(0, 0)
-                    # Add boundaries to split important chunks
-                    topk_indices_b = self.producer.attentive_ssm.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
-                    additional_boundaries = []
-                    for c in topk_indices_b:
-                        c = c.item()
-                        # Existing boundary for chunk c
-                        boundary = (c +1) * K -1  # Position of the chunk's end
-                        # Insert a new boundary to split the chunk into two
-                        new_boundary = c * K + (K//2)  # Split at middle
-                        if 0 <= new_boundary < seq_len:
-                            additional_boundaries.append(new_boundary)
-                    boundaries_b = sorted(set(boundaries_b + additional_boundaries))
-                    if boundaries_b and boundaries_b[-1] != seq_len -1:
-                        boundaries_b.append(seq_len -1)
-                    boundaries_list.append(boundaries_b)
+
+                    if self.fattn_boundary == "uniform":
+                        # Add boundaries to split important chunks
+                        topk_indices_b = self.producer.attentive_ssm.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
+                        additional_boundaries = []
+                        for c in topk_indices_b:
+                            c = c.item()
+                            # Existing boundary for chunk c
+                            boundary = (c +1) * K -1  # Position of the chunk's end
+                            # Insert a new boundary to split the chunk into two
+                            new_boundary = c * K + (K//2)  # Split at middle
+                            if 0 <= new_boundary < seq_len:
+                                additional_boundaries.append(new_boundary)
+                        boundaries_b = sorted(set(boundaries_b + additional_boundaries))
+                        if boundaries_b and boundaries_b[-1] != seq_len -1:
+                            boundaries_b.append(seq_len -1)
+                        boundaries_list.append(boundaries_b)
+                    elif self.fattn_boundary == "breakpoint":
+                        # Note that this breakpoint works differently from attention
+                        # This one just takes the top self.additional_tokens/K chunks
+                        # And adds boundary of length 1 (which means no chunking there)
+                        num_chunks_to_split = self.additional_tokens // K
+                        topk_indices_b = self.producer.attentive_ssm.topk_indices[b, :num_chunks_to_split]  # Shape: [num_chunks_to_split]
+                        additional_boundaries = set()
+                        for c in topk_indices_b:
+                            c = c.item()
+                            start = c * K
+                            end = min((c + 1) * K, seq_len)
+                            additional_boundaries.update(range(start, end))
+                        combined_boundaries = set(boundaries_b).union(additional_boundaries)
+                        boundaries_b = sorted(combined_boundaries)
+                        if boundaries_b and boundaries_b[-1] != seq_len - 1:
+                            boundaries_b.append(seq_len - 1)
+                        boundaries_list.append(boundaries_b)
+                    else:
+                        raise NotImplementedError(f"Boundary strategy {self.fattn_boundary} not supported")
             elif self.chunk_strat == "first_ssm" and self.producer is None:
                 # this is the first ssm, do uniform chunking
                 boundaries_list = list(range(K - 1, seq_len, K))
@@ -601,7 +662,10 @@ class AttentiveSSM(nn.Module):
                 t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
                 k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
                 is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
-                mask_condition = ((k_abs < t_abs) & is_chunk_boundary_k) | (k_abs == t_abs - 1) | (k_abs == t_abs)
+                leading_tokens = 1
+                lower_bound = (t_abs - leading_tokens).clamp(min=0)
+                mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+                # mask_condition = ((k_abs < t_abs) & is_chunk_boundary_k) | (k_abs == t_abs - 1) | (k_abs == t_abs)
                 if self.keep_sink:
                     additional_mask = (k_abs < 4) & (k_abs <= t_abs)
                     mask_condition |= additional_mask
@@ -645,7 +709,11 @@ class AttentiveSSM(nn.Module):
 
     def reset_parameters(self, init_std=None, factor=1.0):
         init_std = init_std or (self.dim ** (-0.5))
-        for w in [self.wq, self.wk, self.wv]:
+        if self.keep_wproj:
+            initlist = [self.wq, self.wk, self.wv]
+        else:
+            initlist = [self.wq]
+        for w in initlist:
             nn.init.trunc_normal_(
                 w.weight,
                 mean=0.0,

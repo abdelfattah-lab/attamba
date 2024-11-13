@@ -48,6 +48,7 @@ class BaseAttambaArgs:
     pseudo_chunk: bool = False
     sep_ssm: bool = True # Deprecated, always True
     keep_wproj: bool = True
+    fattn_boundary: str = "uniform"
     ssm_hiddim: int = 512
     kvssm_dim: int = 32
     n_layers: int = 8
@@ -472,6 +473,7 @@ class AttambaBlock(nn.Module):
             layer_idx=layer_idx,
             nlayers=args.n_layers,
             keep_wproj=args.keep_wproj,
+            fattn_boundary=args.fattn_boundary,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
