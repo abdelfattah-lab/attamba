@@ -146,7 +146,11 @@ class EvalHarnessLM(LM):
         _, lls, _ = self.generator.generate(prompts)
         results = []
         for ll in lls:
-            results.append((ll.sum().item(),))
+            results.append((ll.sum().item(), len(ll)))
+            # results.append((ll.sum().item(),))
+        # loglikelihood
+        # import math
+        # pplx = sum([math.exp(-ll / length) for ll, length in results])/len(lls)
         self.generator.max_gen_len = max_gen_len
 
         return results

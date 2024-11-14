@@ -1,13 +1,9 @@
 # Template config, need to change dump_dir, data.root_dir and tokenizer.path
 
-dump_dir: "/scratch/ya255/lingua/debugdump/xmer_base"
-name: "xmer_base"
-#     Steps Tokens Covered
-# 2    1000      1 million
-# 3   10000     10 million
-# 4  100000    102 million
+dump_dir: "/scratch/ya255/lingua/final_runs/xmer_100k"
+name: "xmer_100k"
 
-steps: 30_000
+steps: 100_000
 probe_freq: null
 seed: 777
 
@@ -27,7 +23,7 @@ distributed:
     tp_size: 1
 
 model:
-    dim: 256
+    dim: 512
     n_layers: 8
     n_heads: 8
 
@@ -35,9 +31,9 @@ data:
     root_dir: /scratch/ya255/lingua/finewebdata/
     sources:
         fineweb_edu_10bt_shuffled: 100.0
-    batch_size: 8
-    prefetch_size: 1024
-    seq_len: 4096
+    batch_size: 64
+    prefetch_size: 512
+    seq_len: 1024
     n_views: 2
     load_async: true
     add_bos: true
@@ -58,27 +54,18 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 50000
+        every: 5
         keep: -1
         
 logging:
     freq: 10
-    wandb:
-        project: "attamba_selection"
+    # wandb:
+    #     project: "attamba_final"
 
 eval:
     generator:
         max_tokens: 1024
         dtype: bf16
-        # temperature: 1.0
-        # top_p: 0.95
     harness:
-        limit: 200
         tasks:
             - wikitext
-            # - piqa
-            # - arc_easy
-            # - gsm8k
-            # - wikitext
-            # - task: nq_open
-            #   num_fewshot: 5

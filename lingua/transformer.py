@@ -564,6 +564,22 @@ class AttentiveSSM(nn.Module):
                     boundaries_list.append(seq_len -1)
                 if boundaries_list and boundaries_list[0] != 0:
                     boundaries_list.insert(0, 0)
+            elif self.chunk_strat == "cyclic_pl_rand":
+                boundaries_list = list(range(K - 1, seq_len, K))
+                # increments of self.layer_idx * (token_chunk // self.n_layers)
+                boundary_offset = int(self.layer_idx * (self.token_chunk // self.nlayers))
+                # boundary_offset = int(layer_idx * (token_chunk // nlayers)) - 1
+                boundaries_list = [b - boundary_offset for b in boundaries_list]
+                # Here, we should add +- [token_chunk//2] randomization for SSM processing
+                # to enable test-time robustness to boundaries.
+                # randomize boundary for each element in boundaries_list
+                # Ensure larger than or equal to 0, and smaller than seq_len - 1
+                rand_noise = torch.randint(-self.token_chunk // 2, self.token_chunk // 2, (len(boundaries_list),), device=device)
+                boundaries_list = [max(0, min(b + r, seq_len - 1)) for b, r in zip(boundaries_list, rand_noise)]
+                if boundaries_list and boundaries_list[-1] != seq_len -1:
+                    boundaries_list.append(seq_len -1)
+                if boundaries_list and boundaries_list[0] != 0:
+                    boundaries_list.insert(0, 0)
             else:
                 raise NotImplementedError(f"Chunk strat {self.chunk_strat} not supported")
 
@@ -658,11 +674,12 @@ class AttentiveSSM(nn.Module):
                         is_chunk_boundary[b, boundaries_b] = True
                 else:
                     boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
-                    is_chunk_boundary[:, boundaries] = True
+                    is_chunk_boundary[:, boundaries.int()
+                    ] = True
                 t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
                 k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
                 is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
-                leading_tokens = 1
+                leading_tokens = self.token_chunk
                 lower_bound = (t_abs - leading_tokens).clamp(min=0)
                 mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
                 # mask_condition = ((k_abs < t_abs) & is_chunk_boundary_k) | (k_abs == t_abs - 1) | (k_abs == t_abs)
@@ -699,8 +716,9 @@ class AttentiveSSM(nn.Module):
                 attn_mask=attn_mask,
                 is_causal=causality_mask
             )
-        except:
+        except Exception as e:
             import pdb; pdb.set_trace()
+            
         output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
 
         output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
