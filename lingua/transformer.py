@@ -293,6 +293,1799 @@ class RMSNorm(nn.Module):
         torch.nn.init.ones_(self.weight)  # type: ignore
 
 
+
+class AttentiveSSMWProjUnif(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        # If chunk_strat is first_attention and producer is None
+        # then this later is the producer layer, we need to set
+        # token ordering boundaries in rest of the layers appropriately
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
+            self.eval_imp = True
+        else:
+            self.eval_imp = False
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wk = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        xk = self.wk(x)
+        xv = self.wv(x)
+
+        boundaries_list = list(range(K - 1, seq_len, K))
+        if boundaries_list and boundaries_list[-1] != seq_len -1:
+            boundaries_list.append(seq_len -1)
+        if boundaries_list and boundaries_list[0] != 0:
+            boundaries_list.insert(0, 0)
+
+        boundaries_list = [boundaries_list for _ in range(bsz)]
+        boundaries_list = [bl for bl in boundaries_list]
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        initlist = [self.wq, self.wk, self.wv]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
+
+
+class AttentiveSSMNoProjUnif(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        # If chunk_strat is first_attention and producer is None
+        # then this later is the producer layer, we need to set
+        # token ordering boundaries in rest of the layers appropriately
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
+            self.eval_imp = True
+        else:
+            self.eval_imp = False
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        xk = x
+        xv = x
+
+        boundaries_list = list(range(K - 1, seq_len, K))
+        if boundaries_list and boundaries_list[-1] != seq_len -1:
+            boundaries_list.append(seq_len -1)
+        if boundaries_list and boundaries_list[0] != 0:
+            boundaries_list.insert(0, 0)
+
+        boundaries_list = [boundaries_list for _ in range(bsz)]
+        boundaries_list = [bl for bl in boundaries_list]
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        initlist = [self.wq]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
+class AttentiveSSMNoProjRand(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        # If chunk_strat is first_attention and producer is None
+        # then this later is the producer layer, we need to set
+        # token ordering boundaries in rest of the layers appropriately
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
+            self.eval_imp = True
+        else:
+            self.eval_imp = False
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        xk = x
+        xv = x
+
+        boundaries_list = torch.randperm(seq_len)[:seq_len // K].sort().values.tolist()
+        if boundaries_list and boundaries_list[-1] != seq_len -1:
+            boundaries_list.append(seq_len -1)
+        if boundaries_list and boundaries_list[0] != 0:
+            boundaries_list.insert(0, 0)
+
+        boundaries_list = [boundaries_list for _ in range(bsz)]
+        boundaries_list = [bl for bl in boundaries_list]
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        initlist = [self.wq]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
+
+class AttentiveSSMNoProjCyc(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        # If chunk_strat is first_attention and producer is None
+        # then this later is the producer layer, we need to set
+        # token ordering boundaries in rest of the layers appropriately
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
+            self.eval_imp = True
+        else:
+            self.eval_imp = False
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        xk = x
+        xv = x
+
+        
+        boundaries_list = list(range(K - 1, seq_len, K))
+        # increments of self.layer_idx * (token_chunk // self.n_layers)
+        boundary_offset = int(self.layer_idx * (self.token_chunk // self.nlayers))
+        # boundary_offset = int(layer_idx * (token_chunk // nlayers)) - 1
+        boundaries_list = [b - boundary_offset for b in boundaries_list]
+        if boundaries_list and boundaries_list[-1] != seq_len -1:
+            boundaries_list.append(seq_len -1)
+        if boundaries_list and boundaries_list[0] != 0:
+            boundaries_list.insert(0, 0)
+
+        boundaries_list = [boundaries_list for _ in range(bsz)]
+        boundaries_list = [bl for bl in boundaries_list]
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        initlist = [self.wq]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
+class AttentiveSSMNoProjCycR(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        # If chunk_strat is first_attention and producer is None
+        # then this later is the producer layer, we need to set
+        # token ordering boundaries in rest of the layers appropriately
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
+            self.eval_imp = True
+        else:
+            self.eval_imp = False
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        xk = x
+        xv = x
+
+
+        boundaries_list = list(range(K - 1, seq_len, K))
+        boundary_offset = int(self.layer_idx * (self.token_chunk // self.nlayers))
+        boundaries_list = [b - boundary_offset for b in boundaries_list]
+        rand_noise = torch.randint(-self.token_chunk // 2, self.token_chunk // 2, (len(boundaries_list),), device=device)
+        boundaries_list = [max(0, min(b + r, seq_len - 1)) for b, r in zip(boundaries_list, rand_noise)]
+        
+        if boundaries_list and boundaries_list[-1] != seq_len -1:
+            boundaries_list.append(seq_len -1)
+        if boundaries_list and boundaries_list[0] != 0:
+            boundaries_list.insert(0, 0)
+
+        boundaries_list = [boundaries_list for _ in range(bsz)]
+        boundaries_list = [bl for bl in boundaries_list]
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        initlist = [self.wq]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
+class AttentiveSSMNoProjFSSM(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        if self.chunk_strat in ["first_attention", "first_ssm"] and producer is None:
+            self.eval_imp = True
+        else:
+            self.eval_imp = False
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        xk = x
+        xv = x
+
+        if self.producer is not None:
+            boundaries_list = []
+            for b in range(bsz):
+                # Uniform boundaries
+                boundaries_b = list(range(K -1, seq_len, K))
+                if boundaries_b and boundaries_b[-1] != seq_len -1:
+                    boundaries_b.append(seq_len -1)
+                if boundaries_b and boundaries_b[0] != 0:
+                    boundaries_b.insert(0, 0)
+                topk_indices_b = self.producer.attentive_ssm.topk_indices[b, :self.additional_tokens]  # Shape: [512], assuming 64 top indices
+                additional_boundaries = []
+                for c in topk_indices_b:
+                    c = c.item()
+                    # Existing boundary for chunk c
+                    boundary = (c +1) * K -1  # Position of the chunk's end
+                    # Insert a new boundary to split the chunk into two
+                    new_boundary = c * K + (K//2)  # Split at middle
+                    if 0 <= new_boundary < seq_len:
+                        additional_boundaries.append(new_boundary)
+                boundaries_b = sorted(set(boundaries_b + additional_boundaries))
+                if boundaries_b and boundaries_b[-1] != seq_len -1:
+                    boundaries_b.append(seq_len -1)
+                boundaries_list.append(boundaries_b)
+        else:
+            # this is the first ssm, do uniform chunking
+            boundaries_list = list(range(K - 1, seq_len, K))
+            if boundaries_list and boundaries_list[-1] != seq_len -1:
+                boundaries_list.append(seq_len -1)
+            if boundaries_list and boundaries_list[0] != 0:
+                boundaries_list.insert(0, 0)
+        
+        if self.producer is None:
+            boundaries_list = [boundaries_list for _ in range(bsz)]
+        boundaries_list = [bl for bl in boundaries_list]
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        if self.producer is None:
+            scores = torch.bmm(xq[:, 0, :, :], xk_processed[:, 0, -1, :].unsqueeze(1).transpose(1, 2))
+            scores = scores / (xq.size(-1) ** 0.5)
+            chunkmask = attn_mask[:, 0, -1, :]
+            scores[~chunkmask] = float("-inf")
+            attn_weights = torch.softmax(scores.squeeze(), dim=-1)
+            non_zero_columns = torch.any(attn_weights != 0, dim=0)
+            attn_weights_filtered = attn_weights[:, non_zero_columns]
+            self.topk_indices = torch.sort(attn_weights_filtered, descending=True, dim=-1)[1]
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        initlist = [self.wq]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
+class AttentiveSSMNoProjFAttn(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        token_chunk: int,
+        rope_theta: float,
+        k_ssm: nn.Module,
+        k_ssmnorm: nn.Module,
+        v_ssm,
+        v_ssmnorm,
+        kv_pressm: bool = False,
+        residual_ssm: bool = False,
+        chunk_size: int = 256,
+        pseudo_chunk: bool = False,
+        keep_sink: bool = True,
+        chunk_strat: str = "uniform",
+        producer = None,
+        additional_tokens=64,
+        layer_idx=None,
+        nlayers=None,
+        keep_wproj=True,
+        fattn_boundary="uniform",
+    ):
+        super().__init__()
+        
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.chunk_size = chunk_size
+        self.token_chunk = token_chunk
+        self.k_ssm = k_ssm
+        self.k_ssmnorm = k_ssmnorm
+        self.v_ssm = v_ssm
+        self.v_ssmnorm = v_ssmnorm
+        self.residual_ssm = residual_ssm
+        self.pseudo_chunk = pseudo_chunk
+        self.kv_pressm = kv_pressm
+        self.keep_sink = keep_sink
+        self.chunk_strat = chunk_strat
+        if self.chunk_strat == "head_cycle":
+            self.chunk_strat = "uniform"
+            self.get_rotated = True
+        else:
+            self.get_rotated = False
+        self.additional_tokens = additional_tokens
+        self.keep_wproj = keep_wproj
+        self.fattn_boundary = fattn_boundary
+        # If chunk_strat is first_attention and producer is None
+        # then this later is the producer layer, we need to set
+        # token ordering boundaries in rest of the layers appropriately
+        self.producer = producer
+        self.layer_idx = layer_idx
+        self.nlayers = nlayers
+
+        self.rope_theta = rope_theta
+        self.heads_per_group = self.n_heads // self.n_kv_heads
+
+        if producer is None:
+            self.eval_imp = True
+            self.wk = nn.Linear(dim, n_heads * head_dim, bias=False)
+            self.wv = nn.Linear(dim, n_heads * head_dim, bias=False)
+            self.kv_proj_active = True
+        else:
+            self.kv_proj_active = False
+            self.eval_imp = False
+
+
+        # Projection layers
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+    def process_chunks_with_ssm(self, x, ssm_module, tok_idx, cu_seqlens):
+        bsz, seq_len, edim = x.shape
+        device = x.device
+        total_tokens = bsz * seq_len
+        x_flat = x.view(1, total_tokens, edim)  # Shape: (1, total_tokens, edim)
+        if hasattr(ssm_module, "cache"):
+            del ssm_module.cache
+        ssm_outputs = ssm_module(
+            x_flat,          
+            tok_idx=tok_idx, 
+            cu_seqlens=cu_seqlens,
+            ssm_impl="ssm"
+        )  # Output shape: (1, total_tokens, edim)
+        ssm_outputs = ssm_outputs.view(bsz, seq_len, edim)
+        return ssm_outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+        tok_idx: Optional[torch.Tensor] = None,
+        ssm_tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+        ssm_impl: str = "training",
+        attn_impl: str = "sdpa",
+    ) -> torch.Tensor:
+        bsz, seq_len, dim = x.shape
+        L_q = seq_len
+        n_heads = self.n_heads
+        n_kv_heads = self.n_kv_heads
+        head_dim = self.head_dim
+        device = x.device
+        K = self.token_chunk
+        xq = self.wq(x)
+        bsz, seq_len, edim = x.size()
+
+        if self.kv_proj_active:
+            xk = self.wk(x)
+            xv = self.wv(x)
+        else:
+            xk = x
+            xv = x
+
+        if self.eval_imp:
+            xq = xq.view(bsz, seq_len, n_heads, head_dim)
+            xk = xk.view(bsz, seq_len, n_kv_heads, head_dim)
+            xv = xv.view(bsz, seq_len, n_kv_heads, head_dim)
+            xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis)
+            xk = repeat_kv(xk, self.heads_per_group, dim=2)
+            xv = repeat_kv(xv, self.heads_per_group, dim=2)
+            xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk, xv))
+            xk_last = xk_processed[:, :, -1, :]
+            xq_reshaped = xq.view(-1, xq.size(-2), xq.size(-1))
+            xk_last_reshaped = xk_last.view(-1, xk_last.size(-1), 1)
+            scores = torch.bmm(xq_reshaped, xk_last_reshaped).view(*xq.shape[:2], xq.size(-2), 1)
+            scores = scores / (xq.size(-1) ** 0.5)
+            attn_weights = torch.softmax(scores.squeeze(), dim=-1)
+            extra_topk_indices = torch.topk(attn_weights, 2 * (seq_len // K) // attn_weights.size(1), dim=-1)[1]
+            num_to_keep = self.additional_tokens if self.fattn_boundary == "uniform" else (seq_len // K)
+            self.topk_indices = torch.empty(bsz, num_to_keep, dtype=torch.long, device=attn_weights.device)
+            for i in range(bsz):
+                unique_tokens = torch.unique(extra_topk_indices[i]).tolist()  # Get unique tokens as a list
+                try:
+                    self.topk_indices[i] = torch.tensor(unique_tokens[:num_to_keep], device=attn_weights.device)
+                except:
+                    # take unique_toksn, and for rest use random numbers not in unique_tokens list, between min and max
+                    min_tok = min(unique_tokens)
+                    max_tok = max(unique_tokens)
+                    remaining_tokens = num_to_keep - len(unique_tokens)
+                    range_choices = set(list(range(min_tok, max_tok))) - set(unique_tokens)
+                    random_tokens = torch.tensor(list(range_choices)[:remaining_tokens], device=attn_weights.device)
+                    self.topk_indices[i] = torch.cat([torch.tensor(unique_tokens, device=attn_weights.device), random_tokens])
+            del scores
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            boundaries_list = []
+            for b in range(bsz):
+                topk_indices_b = self.producer.attentive_ssm.topk_indices[b]  # Shape: [64]
+                boundaries_b = torch.unique(topk_indices_b).sort().values.tolist()
+                if not boundaries_b:
+                    boundaries_b = [0, seq_len - 1]
+                else:
+                    if boundaries_b[0] != 0:
+                        boundaries_b.insert(0, 0)
+                    if boundaries_b[-1] != seq_len - 1:
+                        boundaries_b.append(seq_len - 1)
+                boundaries_list.append(boundaries_b)
+
+        total_boundaries = []
+        sequence_starts_list = []
+        sequence_lengths_list = []
+        for b in range(bsz):
+            boundaries_b = torch.tensor(boundaries_list[b], device=device)
+            batch_boundaries = boundaries_b + b * seq_len
+            total_boundaries.append(batch_boundaries)
+            if len(boundaries_b) == 0:
+                sequence_starts_b = torch.tensor([0], device=device)
+                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            else:
+                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+            sequence_starts_b += b * seq_len
+            sequence_starts_list.append(sequence_starts_b)
+            sequence_lengths_list.append(sequence_lengths_b)
+        if len(total_boundaries) > 0:
+            total_boundaries = torch.cat(total_boundaries) 
+        else:
+            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+        if len(sequence_starts_list) > 0:
+            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+        else:
+            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+
+        if total_boundaries.numel() > 0:
+            total_boundaries, _ = torch.sort(total_boundaries)
+
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+        if sequence_starts.numel() > 0:
+            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+        else:
+            ssm_kv_tok_idx = positions  # (total_tokens,)
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])  # (total_sequences + 1,)
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+
+        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+
+        # always keep residual.
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
+
+        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+        
+        if hasattr(self, "kv_cache"):
+            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+
+        L_k = xk_processed.size(1)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
+        if self.pseudo_chunk:
+            attn_mask = "causal"
+            causality_mask = True
+        else:
+            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+            is_chunk_boundary[:, boundaries.int()
+            ] = True
+            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+            leading_tokens = self.token_chunk
+            lower_bound = (t_abs - leading_tokens).clamp(min=0)
+            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+            causality_mask = False
+
+        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        try:
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk_processed,
+                xv_processed,
+                attn_mask=attn_mask,
+                is_causal=causality_mask
+            )
+        except Exception as e:
+            import pdb; pdb.set_trace()
+            
+        output = output.transpose(1, 2).contiguous()  # [B, L_q, H_q, D]
+
+        output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
+
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+        if self.kv_proj_active:
+            initlist = [self.wk, self.wv, self.wq]
+        else:
+            initlist = [self.wq]
+        for w in initlist:
+            nn.init.trunc_normal_(
+                w.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+
+
 class AttentiveSSM(nn.Module):
     def __init__(
         self,

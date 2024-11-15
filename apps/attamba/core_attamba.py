@@ -19,8 +19,7 @@ from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 
 from lingua.transformer import FeedForward, InitStdFactor, RMSNorm, RotaryEmbedding
 from lingua.probe import log_stats
-from lingua.transformer import AttentiveSSM
-
+from lingua.transformer import AttentiveSSM, AttentiveSSMNoProjRand, AttentiveSSMNoProjFSSM, AttentiveSSMNoProjFAttn, AttentiveSSMNoProjCyc, AttentiveSSMNoProjCycR, AttentiveSSMWProjUnif, AttentiveSSMNoProjUnif
 
 from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
@@ -450,8 +449,27 @@ class AttambaBlock(nn.Module):
             chunk_size=args.ssm_chunk_size,
         )
 
-        
-        self.attentive_ssm = AttentiveSSM(
+
+        if self.chunk_strat == "random":
+            AttentiveClass = AttentiveSSMNoProjRand
+        elif self.chunk_strat == "first_ssm":
+            AttentiveClass = AttentiveSSMNoProjFSSM
+        elif self.chunk_strat == "first_attention":
+            AttentiveClass = AttentiveSSMNoProjFAttn
+        elif self.chunk_strat == "cyclic_pl":
+            AttentiveClass = AttentiveSSMNoProjCyc
+        elif self.chunk_strat == "cyclic_pl_rand":
+            AttentiveClass = AttentiveSSMNoProjCycR
+        elif self.chunk_strat == "uniform":
+            if self.keep_wproj:
+                AttentiveClass = AttentiveSSMWProjUnif
+            else:
+                AttentiveClass = AttentiveSSMNoProjUnif
+        else:
+            raise ValueError(f"Invalid strategy combination.")
+ 
+
+        self.attentive_ssm = AttentiveClass(
             dim=args.dim,
             head_dim=args.head_dim,
             n_heads=self.n_heads,
