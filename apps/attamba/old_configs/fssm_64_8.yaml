@@ -2,10 +2,10 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/arxiv_runs/cycrnd_64"
-name: "cycrnd_64"
+dump_dir: "/scratch/ya255/lingua/custom_runs/cyclic_pl_rand_8"
+name: "cyclic_pl_rand_8"
 
-steps: 100_000
+steps: 30_000
 probe_freq: null
 seed: 777
 
@@ -21,29 +21,32 @@ distributed:
     compile: true
     model_dtype: bf16
     matmul_allow_tf32: false
-    selective_activation_checkpointing: false
+    selective_activation_checkpointing: true
     tp_size: 1
 
 model:
-    dim: 512
-    token_chunk: 64
+    dim: 256
+    token_chunk: 8
     pseudo_chunk: false
-    head_dim: 64
+    head_dim: 32
     n_layers: 8
     n_heads: 8
     
     # ssm params
     keep_sink: false
     keep_wproj: false
+    # cyclic per-head is likely best, but doesnt have good train-time characteristics
+    # It might be possible to train with random boundaries, then generalize to cyclic perhead
+    # But then we would need all boundary-SSM, which is not efficient.
     chunk_strat: cyclic_pl_rand # random, uniform, first_attention [todo: first_ssm: would work because of residual]
     fattn_boundary: breakpoint
     additional_tokens: 64
-    kvssm_dim: 512
-    state_dim: 128
-    ssm_chunk_size: 64  # Should be same as token_chunk ?
+    kvssm_dim: 256
+    state_dim: 256
+    ssm_chunk_size: 32  # Should be same as token_chunk ?
     n_groups: 1
     residual_ssm: true
-    ssm_hiddim: 128         # hidden_dim  -- [MATCH (?) dim]
+    ssm_hiddim: 256         # hidden_dim  -- [MATCH (?) dim]
     learnable_init_states: false
     ssm_heads: 8
     conv_size: 4
@@ -62,9 +65,9 @@ data:
     root_dir: /scratch/ya255/lingua/finewebdata/
     sources:
         fineweb_edu_10bt_shuffled: 100.0
-    batch_size: 32
-    prefetch_size: 512
-    seq_len: 1024
+    batch_size: 8
+    prefetch_size: 1024
+    seq_len: 4096
     n_views: 2
     load_async: true
     add_bos: true
@@ -91,14 +94,21 @@ checkpoint:
 logging:
     freq: 10
     wandb:
-        project: "attamba_arxiv"
-    # wandb:
-    #     project: "attamba_fixed"   
+        project: "attamba_fixed"   
 
 eval:
     generator:
+        # max_tokens: 8192
         max_tokens: 1024
         dtype: bf16
+        # temperature: 1.0
+        # top_p: 0.95
     harness:
+        limit: 400
         tasks:
             - wikitext
+            # - piqa
+            # - winogrande
+            # - arc_easy
+            # - gsm8k
+            # - openbookqa

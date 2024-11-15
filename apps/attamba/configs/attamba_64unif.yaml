@@ -2,8 +2,8 @@
 # Evals can be activated by uncommenting its config
 # python -m lingua.stool config=apps/main/configs/debug.yaml nodes=8 account=fair_amaia_cw_codegen qos=lowest
 
-dump_dir: "/scratch/ya255/lingua/arxiv_runs/cycrnd_64"
-name: "cycrnd_64"
+dump_dir: "/scratch/ya255/lingua/arxiv_runs/cycunif_64"
+name: "cycunif_64"
 
 steps: 100_000
 probe_freq: null
@@ -28,14 +28,14 @@ model:
     dim: 512
     token_chunk: 64
     pseudo_chunk: false
-    head_dim: 64
-    n_layers: 8
-    n_heads: 8
+    head_dim: 32
+    n_layers: 16
+    n_heads: 16
     
     # ssm params
     keep_sink: false
     keep_wproj: false
-    chunk_strat: cyclic_pl_rand # random, uniform, first_attention [todo: first_ssm: would work because of residual]
+    chunk_strat: uniform # random, uniform, first_attention [todo: first_ssm: would work because of residual]
     fattn_boundary: breakpoint
     additional_tokens: 64
     kvssm_dim: 512
@@ -62,7 +62,7 @@ data:
     root_dir: /scratch/ya255/lingua/finewebdata/
     sources:
         fineweb_edu_10bt_shuffled: 100.0
-    batch_size: 32
+    batch_size: 16
     prefetch_size: 512
     seq_len: 1024
     n_views: 2

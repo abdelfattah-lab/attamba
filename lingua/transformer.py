@@ -641,8 +641,13 @@ class AttentiveSSM(nn.Module):
             ])  # (total_sequences + 1,)
             ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
     
-
-            xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+            try:
+                xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                import pdb; pdb.set_trace()
+                
             xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
             if self.residual_ssm:
