@@ -1631,7 +1631,7 @@ class AttentiveSSMNoProjFSSM(nn.Module):
             boundaries_list = []
             for b in range(bsz):
                 # Uniform boundaries
-                boundaries_b = list(range(K -1, seq_len, K))
+                boundaries_b = list(range(K - 1, seq_len, K))
                 if boundaries_b and boundaries_b[-1] != seq_len -1:
                     boundaries_b.append(seq_len -1)
                 if boundaries_b and boundaries_b[0] != 0:
@@ -1927,22 +1927,30 @@ class AttentiveSSMNoProjFAttn(nn.Module):
             xk_last_reshaped = xk_last.view(-1, xk_last.size(-1), 1)
             scores = torch.bmm(xq_reshaped, xk_last_reshaped).view(*xq.shape[:2], xq.size(-2), 1)
             scores = scores / (xq.size(-1) ** 0.5)
-            attn_weights = torch.softmax(scores.squeeze(), dim=-1)
-            extra_topk_indices = torch.topk(attn_weights, 2 * (seq_len // K) // attn_weights.size(1), dim=-1)[1]
-            num_to_keep = self.additional_tokens if self.fattn_boundary == "uniform" else (seq_len // K)
+            scores_first_head = scores[:, 0, :, :]  # Shape: [bsz, seq_len, 1]
+            attn_weights = torch.softmax(scores_first_head.squeeze(-1), dim=-1)  # Shape: [bsz, seq_len]
+            # extra_topk_indices = torch.topk(attn_weights, 2 * (seq_len // K) // attn_weights.size(1), dim=-1)[1]
+            extra_topk_indices = torch.topk(attn_weights, 2 * (seq_len // K), dim=-1)[1]
+            num_to_keep = seq_len // K
             self.topk_indices = torch.empty(bsz, num_to_keep, dtype=torch.long, device=attn_weights.device)
+            # try:
             for i in range(bsz):
-                unique_tokens = torch.unique(extra_topk_indices[i]).tolist()  # Get unique tokens as a list
+                relidx = extra_topk_indices[i].flatten()
+                # Random shuffle relidx
+                relidx = relidx[torch.randperm(relidx.size(0))]
+                unique_tokens = torch.unique(relidx).tolist()  # Get unique tokens as a list
                 try:
                     self.topk_indices[i] = torch.tensor(unique_tokens[:num_to_keep], device=attn_weights.device)
                 except:
-                    # take unique_toksn, and for rest use random numbers not in unique_tokens list, between min and max
+                    # take unique_tokens, and for rest use random numbers not in unique_tokens list, between min and max
                     min_tok = min(unique_tokens)
                     max_tok = max(unique_tokens)
                     remaining_tokens = num_to_keep - len(unique_tokens)
                     range_choices = set(list(range(min_tok, max_tok))) - set(unique_tokens)
                     random_tokens = torch.tensor(list(range_choices)[:remaining_tokens], device=attn_weights.device)
                     self.topk_indices[i] = torch.cat([torch.tensor(unique_tokens, device=attn_weights.device), random_tokens])
+            # except:
+            #     import pdb; pdb.set_trace()
             del scores
             attn_mask = "causal"
             causality_mask = True
@@ -1959,90 +1967,88 @@ class AttentiveSSMNoProjFAttn(nn.Module):
                     if boundaries_b[-1] != seq_len - 1:
                         boundaries_b.append(seq_len - 1)
                 boundaries_list.append(boundaries_b)
-
-        total_boundaries = []
-        sequence_starts_list = []
-        sequence_lengths_list = []
-        for b in range(bsz):
-            boundaries_b = torch.tensor(boundaries_list[b], device=device)
-            batch_boundaries = boundaries_b + b * seq_len
-            total_boundaries.append(batch_boundaries)
-            if len(boundaries_b) == 0:
-                sequence_starts_b = torch.tensor([0], device=device)
-                sequence_lengths_b = torch.tensor([seq_len], device=device)
+            total_boundaries = []
+            sequence_starts_list = []
+            sequence_lengths_list = []
+            for b in range(bsz):
+                boundaries_b = torch.tensor(boundaries_list[b], device=device)
+                batch_boundaries = boundaries_b + b * seq_len
+                total_boundaries.append(batch_boundaries)
+                if len(boundaries_b) == 0:
+                    sequence_starts_b = torch.tensor([0], device=device)
+                    sequence_lengths_b = torch.tensor([seq_len], device=device)
+                else:
+                    sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
+                    sequence_lengths_b = boundaries_b - sequence_starts_b + 1
+                sequence_starts_b += b * seq_len
+                sequence_starts_list.append(sequence_starts_b)
+                sequence_lengths_list.append(sequence_lengths_b)
+            if len(total_boundaries) > 0:
+                total_boundaries = torch.cat(total_boundaries) 
             else:
-                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
-                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
-            sequence_starts_b += b * seq_len
-            sequence_starts_list.append(sequence_starts_b)
-            sequence_lengths_list.append(sequence_lengths_b)
-        if len(total_boundaries) > 0:
-            total_boundaries = torch.cat(total_boundaries) 
-        else:
-            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
-        if len(sequence_starts_list) > 0:
-            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
-            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
-        else:
-            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
-            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
+                total_boundaries = torch.tensor([], device=device, dtype=torch.long)
+            if len(sequence_starts_list) > 0:
+                sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
+                sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
+            else:
+                sequence_starts = torch.tensor([], device=device, dtype=torch.long)
+                sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
 
-        if total_boundaries.numel() > 0:
-            total_boundaries, _ = torch.sort(total_boundaries)
+            if total_boundaries.numel() > 0:
+                total_boundaries, _ = torch.sort(total_boundaries)
+            total_tokens = bsz * seq_len
+            positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
+            sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
+            if sequence_starts.numel() > 0:
+                sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
+                ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
+            else:
+                ssm_kv_tok_idx = positions  # (total_tokens,)
+            cu_seqlens = torch.cat([
+                torch.tensor([0], device=device, dtype=torch.int32),
+                torch.cumsum(sequence_lengths, dim=0)
+            ])  # (total_sequences + 1,)
+            ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
 
-        total_tokens = bsz * seq_len
-        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
-        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
-        if sequence_starts.numel() > 0:
-            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
-            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
-        else:
-            ssm_kv_tok_idx = positions  # (total_tokens,)
-        cu_seqlens = torch.cat([
-            torch.tensor([0], device=device, dtype=torch.int32),
-            torch.cumsum(sequence_lengths, dim=0)
-        ])  # (total_sequences + 1,)
-        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
+            xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
+            xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
-        xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
-        xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
+            # always keep residual.
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
 
-        # always keep residual.
-        xk_processed = xk_processed + xk
-        xv_processed = xv_processed + xv
+            xq = xq.view(bsz, seq_len, n_heads,    head_dim)
+            xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
+            xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
+            xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
+            
+            if hasattr(self, "kv_cache"):
+                xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
 
-        xq = xq.view(bsz, seq_len, n_heads,    head_dim)
-        xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
-        xv_processed = xv_processed.view(bsz, -1, n_kv_heads, head_dim)
-        xq, xk_processed = apply_rotary_emb(xq, xk_processed, 1, freq_cis)
-        
-        if hasattr(self, "kv_cache"):
-            xk_processed, xv_processed = self.kv_cache.update(xk_processed, xv_processed, tok_idx)
+            L_k = xk_processed.size(1)
 
-        L_k = xk_processed.size(1)
+            xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+            xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
 
-        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
-        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+            if self.pseudo_chunk:
+                attn_mask = "causal"
+                causality_mask = True
+            else:
+                is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
+                boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
+                is_chunk_boundary[:, boundaries.int()
+                ] = True
+                t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
+                k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
+                is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
+                leading_tokens = self.token_chunk
+                lower_bound = (t_abs - leading_tokens).clamp(min=0)
+                mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
+                attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
+                attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
+                causality_mask = False
 
-        if self.pseudo_chunk:
-            attn_mask = "causal"
-            causality_mask = True
-        else:
-            is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
-            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
-            is_chunk_boundary[:, boundaries.int()
-            ] = True
-            t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
-            k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
-            is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
-            leading_tokens = self.token_chunk
-            lower_bound = (t_abs - leading_tokens).clamp(min=0)
-            mask_condition = ( ((k_abs < t_abs) & is_chunk_boundary_k) | ((k_abs >= lower_bound) & (k_abs <= t_abs)) )
-            attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
-            attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
-            causality_mask = False
-
-        xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
+            xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
 
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         try:

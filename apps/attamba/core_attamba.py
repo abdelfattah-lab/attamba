@@ -448,7 +448,8 @@ class AttambaBlock(nn.Module):
             learnable_init_states=args.learnable_init_states,
             chunk_size=args.ssm_chunk_size,
         )
-
+        self.chunk_strat = args.chunk_strat
+        self.keep_wproj = args.keep_wproj
 
         if self.chunk_strat == "random":
             AttentiveClass = AttentiveSSMNoProjRand
