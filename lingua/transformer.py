@@ -1386,9 +1386,10 @@ class AttentiveSSMNoProjCycR(nn.Module):
         boundaries_list = list(range(K - 1, seq_len, K))
         boundary_offset = int(self.layer_idx * (self.token_chunk // self.nlayers))
         boundaries_list = [b - boundary_offset for b in boundaries_list]
-        rand_noise = torch.randint(-self.token_chunk // 2, self.token_chunk // 2, (len(boundaries_list),), device=device)
-        boundaries_list = [max(0, min(b + r, seq_len - 1)) for b, r in zip(boundaries_list, rand_noise)]
-        
+        # rand_noise = torch.randint(-self.token_chunk // 4, self.token_chunk // 4, (len(boundaries_list),), device=device)
+        # boundaries_list = [max(0, min(b + r, seq_len - 1)) for b, r in zip(boundaries_list, rand_noise)]
+        # sort boundaries
+        boundaries_list = sorted(boundaries_list)
         if boundaries_list and boundaries_list[-1] != seq_len -1:
             boundaries_list.append(seq_len -1)
         if boundaries_list and boundaries_list[0] != 0:
