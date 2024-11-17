@@ -19,7 +19,7 @@ from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 
 from lingua.transformer import FeedForward, InitStdFactor, RMSNorm, RotaryEmbedding
 from lingua.probe import log_stats
-from lingua.transformer import AttentiveSSM, AttentiveSSMNoProjRand, AttentiveSSMNoProjFSSM, AttentiveSSMNoProjFAttn, AttentiveSSMNoProjCyc, AttentiveSSMNoProjCycR, AttentiveSSMWProjUnif, AttentiveSSMNoProjUnif
+from lingua.transformer import AttentiveSSM, AttentiveSSMNoProjRand, AttentiveSSMNoProjFSSM, AttentiveSSMNoProjFAttn, AttentiveSSMNoProjCyc, AttentiveSSMWProjUnif, AttentiveSSMNoProjUnif
 
 from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
@@ -53,6 +53,7 @@ class BaseAttambaArgs:
     n_layers: int = 8
     n_heads: int = 8
     token_chunk: int = 32
+    leading_tokens: int = 1
     kv_pressm: bool = False # Deprecated, always False
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
@@ -460,7 +461,7 @@ class AttambaBlock(nn.Module):
         elif self.chunk_strat == "cyclic_pl":
             AttentiveClass = AttentiveSSMNoProjCyc
         elif self.chunk_strat == "cyclic_pl_rand":
-            AttentiveClass = AttentiveSSMNoProjCycR
+            raise NotImplementedError("Cyclic PL with random chunking not working.")
         elif self.chunk_strat == "uniform":
             if self.keep_wproj:
                 AttentiveClass = AttentiveSSMWProjUnif
@@ -493,6 +494,7 @@ class AttambaBlock(nn.Module):
             nlayers=args.n_layers,
             keep_wproj=args.keep_wproj,
             fattn_boundary=args.fattn_boundary,
+            leading_tokens=args.leading_tokens,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,

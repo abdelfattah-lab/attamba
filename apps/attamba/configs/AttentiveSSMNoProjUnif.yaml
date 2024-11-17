@@ -27,6 +27,7 @@ distributed:
 model:
     dim: 512
     token_chunk: 8
+    leading_tokens: 8
     pseudo_chunk: false
     head_dim: 64
     n_layers: 8

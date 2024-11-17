@@ -27,6 +27,7 @@ distributed:
 model:
     dim: 512
     token_chunk: 8
+    leading_tokens: 8
     pseudo_chunk: false
     head_dim: 64
     n_layers: 8
@@ -87,13 +88,13 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 50
+        every: 5000
         keep: -1
 
 logging:
     freq: 10
-    # wandb:
-    #     project: "attamba_arxiv"
+    wandb:
+        project: "attamba_arxiv"
     # wandb:
     #     project: "attamba_fixed"   
 
