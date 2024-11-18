@@ -1,7 +1,7 @@
 # Template config, need to change dump_dir, data.root_dir and tokenizer.path
 
-dump_dir: "/scratch/ya255/lingua/reported_runs/xmer_100k_dclm"
-name: "xmer_100k_dclm"
+dump_dir: "/scratch/ya255/lingua/reported_runs/xmer_60k_dclm_64M"
+name: "xmer_60k_dclm_64M"
 
 steps: 60_000
 probe_freq: null
@@ -24,7 +24,7 @@ distributed:
 
 model:
     dim: 512
-    n_layers: 8
+    n_layers: 9
     n_heads: 8
 
 data:
@@ -33,7 +33,7 @@ data:
     sources:
         # fineweb_edu_10bt_shuffled: 100.0
         dclm_baseline_1.0_shuffled: 100.0
-    batch_size: 128
+    batch_size: 16
     prefetch_size: 512
     seq_len: 1024
     n_views: 2
@@ -56,13 +56,13 @@ checkpoint:
         every: 10000
         keep: 3
     eval:
-        every: 50
+        every: 5000
         keep: -1
         
 logging:
     freq: 10
-    # wandb:
-    #     project: "attamba_arxiv"
+    wandb:
+        project: "attamba_arxiv"
 
 eval:
     generator:
