@@ -40,11 +40,11 @@ model:
     fattn_boundary: breakpoint
     additional_tokens: 64
     kvssm_dim: 512
-    state_dim: 128
+    state_dim: 32
     ssm_chunk_size: 64  # Should be same as token_chunk ?
     n_groups: 1
     residual_ssm: true
-    ssm_hiddim: 128         # hidden_dim  -- [MATCH (?) dim]
+    ssm_hiddim: 32         # hidden_dim  -- [MATCH (?) dim]
     learnable_init_states: false
     ssm_heads: 8
     conv_size: 4

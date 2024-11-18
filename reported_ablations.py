@@ -60,9 +60,11 @@ def plot_experiment_group_7(directory, experiment_names, file_name):
     transformer_final_perplexity = load_metrics_from_folder(os.path.join(directory, "xmer_100k_dclm"))[1][-1]
     plt.axhline(y=transformer_final_perplexity, color="black", linestyle="--", label="Transformer")
 
-    plt.legend(fontsize=14, loc="upper right")
+    plt.legend(fontsize=24, loc="upper right")
     plt.title("Impact of Full-Attention on Leading L Tokens", fontsize=24)
     plt.tight_layout()
+    # plt.yscale("log")
+    plt.xscale("log")
     os.makedirs("reported_graphs", exist_ok=True)
     plt.savefig(os.path.join("reported_graphs", file_name))
     plt.close()
