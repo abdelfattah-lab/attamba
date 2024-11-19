@@ -3,9 +3,33 @@ import json
 import argparse
 import matplotlib.pyplot as plt
 from matplotlib import cycler
+# name_dict = {
+#     "AttentiveSSMNoProjCyc8L16_Long": "Attamba\u00A0\u00A0(512, 8, 16, \u00A0\u00A0\u00A0\u00A032, \u00A0\u00A0\u00A01, \u00A0\u00A08)",
+#     "xmer_long": "Xmer\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0(512, 0, \u00A0\u00A00, \u00A0\u00A0\u00A0\u00A0\u00A0\u00A00, \u00A0\u00A0\u00A00, \u00A0\u00A08)",
+#     "mamba_long": "Mamba\u00A0\u00A0\u00A0\u00A0(640, 0, \u00A0\u00A00, \u00A0\u00A0\u00A0\u00A064, \u00A0\u00A0\u00A01, \u00A0\u00A08)",
+    
+#     "mamba_long_v2": "Mamba\u00A0\u00A0\u00A0\u00A0(512, 0, \u00A0\u00A00, 1024, \u00A0\u00A0\u00A02, \u00A0\u00A08)",
+#     "AttentiveSSMNoProjCyc4L32_Long": "Attamba\u00A0\u00A0(512, 4, 32, \u00A0\u00A0\u00A0\u00A032, \u00A0\u00A0\u00A01, \u00A0\u00A08)",
+#     "mamba_longrun": "Mamba\u00A0\u00A0\u00A0\u00A0(512, 0, \u00A0\u00A00, \u00A0\u00A0128, \u00A016, 16)",
+# }
 
+
+name_dict = {
+    "AttentiveSSMNoProjCyc8L16_Long": "Attamba\u00A0\u00A0(512\u00A0 8\u00A0 16\u00A0 \u00A0\u00A0\u00A0\u00A032\u00A0 \u00A0\u00A0\u00A01\u00A0 \u00A0\u00A08)",
+    "xmer_long": "Xmer\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0(512\u00A0 0\u00A0 \u00A0\u00A00\u00A0 \u00A0\u00A0\u00A0\u00A0\u00A0\u00A00\u00A0 \u00A0\u00A0\u00A00\u00A0 \u00A0\u00A08)",
+    "mamba_long": "Mamba\u00A0\u00A0\u00A0\u00A0(640\u00A0 0\u00A0 \u00A0\u00A00\u00A0 \u00A0\u00A0\u00A0\u00A064\u00A0 \u00A0\u00A0\u00A01\u00A0 \u00A0\u00A08)",
+    
+    "mamba_long_v2": "Mamba\u00A0\u00A0\u00A0\u00A0(512\u00A0 0\u00A0 \u00A0\u00A00\u00A0 1024\u00A0 \u00A0\u00A0\u00A02\u00A0 \u00A0\u00A08)",
+    "AttentiveSSMNoProjCyc4L32_Long": "Attamba\u00A0\u00A0(512\u00A0 4\u00A0 32\u00A0 \u00A0\u00A0\u00A0\u00A032\u00A0 \u00A0\u00A0\u00A01\u00A0 \u00A0\u00A08)",
+    "mamba_longrun": "Mamba\u00A0\u00A0\u00A0\u00A0(512\u00A0 0\u00A0 \u00A0\u00A00\u00A0 \u00A0\u00A0128\u00A0 \u00A016\u00A0 16)",
+}
+
+skip_expts = [""] # These are lower params, so skip them -- actually log differs so its ok.
+
+
+expt_order = ["AttentiveSSMNoProjCyc8L16_Long", "AttentiveSSMNoProjCyc4L32_Long", "mamba_long", "mamba_longrun", "mamba_long_v2", "xmer_long"]
 colors = plt.cm.tab20.colors  # Use a colormap for more distinct colors
-markers = ['o', 's', 'D', '^', 'v', '<', '>', 'p', '*', 'h', 'X', 'P', '|', '+', 'x']
+markers = ['o', '<', '*', 'h', 'X', 'P', '|', '+', 's', 'D', '^', 'v',  '>', 'p', 'x']
 
 # Ensure the cycler uses equal-length cycles
 num_combinations = min(len(colors), len(markers))
@@ -34,25 +58,34 @@ def plot_results(directory, selected_experiments=None):
     if selected_experiments:
         experiments = [exp for exp in experiments if exp in selected_experiments]
 
+    experiments = [exp for exp in expt_order if exp in experiments]
+
     plt.figure(figsize=(10, 6))
-    plt.title("Perplexity vs. Global Step", fontsize=14)
-    plt.xlabel("Global Step", fontsize=12)
-    plt.ylabel("Word Perplexity", fontsize=12)
+    plt.title("Comparing Transformers, Mamba and Attamba", fontsize=24)
+    plt.xlabel("Global Step", fontsize=24)
+    plt.ylabel("WK2 Perplexity", fontsize=24)
     plt.grid(visible=True, linestyle="--", alpha=0.5)
 
     marker_index = 0  # Initialize marker index
 
     for experiment in experiments:
+        if experiment in skip_expts:
+            continue
         folder_path = os.path.join(directory, experiment)
         if os.path.isdir(folder_path):
             steps, perplexities = load_metrics_from_folder(folder_path)
             if steps and perplexities:
-                plt.plot(steps, perplexities, label=experiment, linestyle="-", 
-                         color=colors[marker_index % num_combinations], marker=markers[marker_index % len(markers)])
+                # Use name_dict to change experiment name if it exists in the dictionary
+                plot_label = name_dict.get(experiment, experiment)
+                
+                plt.plot(steps, perplexities, label=plot_label, linestyle="-", 
+                         color=colors[marker_index % num_combinations], markersize=12, marker=markers[marker_index % len(markers)])
                 marker_index += 1  # Increment marker index
 
-    plt.legend(title="Experiments", fontsize=10)
+    plt.legend(title = "\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0E\u00A0\u00A0\u00A0 C \u00A0\u00A0\u00A0L \u00A0\u00A0\u00A0\u00A0\u00A0\u00A0Ds \u00A0\u00A0\u00A0G \u00A0\u00A0\u00A0H\u00A0", title_fontsize=16, fontsize=16, ncol=1, loc="upper right")
     plt.tight_layout()
+    plt.xlim(60000, 100000)
+    plt.ylim(20, 30)
     plt.savefig("collated_results.pdf")
     print("Plot saved as 'collated_results.pdf'")
 

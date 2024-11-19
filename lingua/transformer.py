@@ -465,8 +465,10 @@ class AttentiveSSMWProjUnif(nn.Module):
         xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
         # always keep residual.
-        xk_processed = xk_processed + xk
-        xv_processed = xv_processed + xv
+        if self.residual_ssm:
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
+
 
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
@@ -710,8 +712,10 @@ class AttentiveSSMNoProjUnif(nn.Module):
         xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
         # always keep residual.
-        xk_processed = xk_processed + xk
-        xv_processed = xv_processed + xv
+        if self.residual_ssm:
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
+
 
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
@@ -953,8 +957,10 @@ class AttentiveSSMNoProjRand(nn.Module):
         xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
         # always keep residual.
-        xk_processed = xk_processed + xk
-        xv_processed = xv_processed + xv
+        if self.residual_ssm:
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
+
 
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
@@ -1202,8 +1208,9 @@ class AttentiveSSMNoProjCyc(nn.Module):
         xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
         # always keep residual.
-        xk_processed = xk_processed + xk
-        xv_processed = xv_processed + xv
+        if self.residual_ssm:
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
 
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
@@ -1468,8 +1475,10 @@ class AttentiveSSMNoProjFSSM(nn.Module):
         xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
         # always keep residual.
-        xk_processed = xk_processed + xk
-        xv_processed = xv_processed + xv
+        if self.residual_ssm:
+            xk_processed = xk_processed + xk
+            xv_processed = xv_processed + xv
+
 
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
@@ -1773,8 +1782,9 @@ class AttentiveSSMNoProjFAttn(nn.Module):
             xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
             # always keep residual.
-            xk_processed = xk_processed + xk
-            xv_processed = xv_processed + xv
+            if self.residual_ssm:
+                xk_processed = xk_processed + xk
+                xv_processed = xv_processed + xv
 
             xq = xq.view(bsz, seq_len, n_heads,    head_dim)
             xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)

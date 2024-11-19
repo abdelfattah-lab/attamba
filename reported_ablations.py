@@ -6,7 +6,10 @@ from matplotlib import cycler
 
 # Define colors and markers
 colors = plt.cm.tab20.colors  # Use a colormap for distinct colors
-markers = ['o', 's', 'D', '^', 'v', '<', '>', 'p', '*', 'h', 'X', 'P', '|', '+', 'x']
+# markers = ['o', 's', 'D', '^', 'v', '<', '>', 'p', '*', 'h', 'X', 'P', '|', '+', 'x']
+markers = ['o', '<', '*', 'h', 'X', 'P', '|', '+', 's', 'D', '^', 'v',  '>', 'p', 'x']
+
+
 num_combinations = min(len(colors), len(markers))
 
 # Set up color and marker cycler
@@ -16,8 +19,8 @@ plt.gca().set_prop_cycle(cycler('color', colors[:num_combinations]))
 def plot_experiment_group_7(directory, experiment_names, file_name):
     """Plots and saves the structured results for experiment_group 7"""
     plt.figure(figsize=(10, 6))
-    plt.xlabel("L (Leading Uncompressed Tokens)", fontsize=18)
-    plt.ylabel("WK2 Perplexity", fontsize=18)
+    plt.xlabel("L (Leading Uncompressed Tokens)", fontsize=24)
+    plt.ylabel("WK2 Perplexity", fontsize=24)
     plt.grid(visible=True, linestyle="--", alpha=0.5)
 
     # Use the mapping to simplify experiment classification
@@ -54,7 +57,7 @@ def plot_experiment_group_7(directory, experiment_names, file_name):
     for label in layer_sizes:
         # ensure it is sorted by 'L'
         layer_sizes[label], perplexities[label] = zip(*sorted(zip(layer_sizes[label], perplexities[label])))
-        plt.plot(layer_sizes[label], perplexities[label], label=label, marker="o", markersize=8, linestyle="-")
+        plt.plot(layer_sizes[label], perplexities[label], label=label, marker="o", markersize=12, linestyle="-")
 
     # Add the Transformer baseline as a horizontal dotted line
     transformer_final_perplexity = load_metrics_from_folder(os.path.join(directory, "xmer_100k_dclm"))[1][-1]
@@ -97,9 +100,9 @@ def get_label(experiment_name, experiment_group):
         }
     elif experiment_group == 2:
         mapping = {
-            "AttentiveSSM_Small_NoProjCyc": "Attamba SSM 2M",
-            "AttentiveSSMNoProjCyc": "Attamba SSM 4M",
-            "AttentiveSSM_Large_NoProjCyc": "Attamba SSM 16M"
+            "AttentiveSSM_Small_NoProjCyc": "Attamba Ds \u00A0\u00A032 (62M)",
+            "AttentiveSSMNoProjCyc": "Attamba Ds 128 (64M)",
+            "AttentiveSSM_Large_NoProjCyc": "Attamba Ds 512 (76M)"
         }
     elif experiment_group == 3:
         mapping = {
@@ -111,17 +114,17 @@ def get_label(experiment_name, experiment_group):
         }
     elif experiment_group == 4:
         mapping = {
-            "AttentiveSSMNoProjCyc4": "Attamba Chunk 4",
-            "AttentiveSSMNoProjCyc": "Attamba Chunk 8",
-            "AttentiveSSMNoProjCyc64": "Attamba Chunk 64",
-            "AttentiveSSMNoProjCyc128": "Attamba Chunk 128"
+            "AttentiveSSMNoProjCyc4": "Attamba C4\u00A0\u00A0\u00A0\u00A0\u00A0L4",
+            "AttentiveSSMNoProjCyc": "Attamba C8\u00A0\u00A0\u00A0\u00A0\u00A0L8",
+            "AttentiveSSMNoProjCyc64": "Attamba C64\u00A0\u00A0\u00A0L64",
+            "AttentiveSSMNoProjCyc128": "Attamba C128 L128"
         }
     elif experiment_group == 5:
         mapping = {
-            "AttentiveSSMNoProjCyc": "Attamba C: 8",
             "xmer_100k_dclm": "Transformer",
-            "AttentiveSSMNoProjCycPseudo": "Pseudo-Attamba C: 8",
-            "AttentiveSSMNoProjCycPseudo128": "Pseudo-Attamba C: 128"
+            "AttentiveSSMNoProjCyc": "Attamba\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0C8\u00A0\u00A0\u00A0\u00A0 L8",
+            "AttentiveSSMNoProjCycPseudo": "Pseudo Attamba C8\u00A0\u00A0\u00A0\u00A0 L1024",
+            "AttentiveSSMNoProjCycPseudo128": "Pseudo Attamba C128 L1024"
         }
     elif experiment_group in [6, 7]:
         mapping = {
@@ -151,12 +154,14 @@ def get_label(experiment_name, experiment_group):
 def plot_experiment(directory, experiment_names, file_name, experiment_group):
     """Plots and saves the results for a given experiment"""
     plt.figure(figsize=(10, 6))
-    plt.xlabel("Global Step", fontsize=18)
-    plt.ylabel("WK2 Perplexity", fontsize=18)
+    plt.xlabel("Global Step", fontsize=24)
+    plt.ylabel("WK2 Perplexity", fontsize=24)
     plt.grid(visible=True, linestyle="--", alpha=0.5)
     
     marker_index = 0  # Initialize marker index
-
+    expt5_ordering = ["xmer_100k_dclm", "AttentiveSSMNoProjCyc", "AttentiveSSMNoProjCycPseudo", "AttentiveSSMNoProjCycPseudo128"]
+    if experiment_group == 5:
+        experiment_names = expt5_ordering
     for experiment in experiment_names:
         folder_path = os.path.join(directory, experiment)
         if os.path.isdir(folder_path):
@@ -170,13 +175,25 @@ def plot_experiment(directory, experiment_names, file_name, experiment_group):
 
     plt.legend(fontsize=24)
     if "expt_1" in file_name:
-        plt.yscale("log")
+        plt.xlim(40000, 60000)
+        # Set upper ylim to 60 without setting lower limit
+        plt.ylim(35, 45)
+        # plt.yscale("log")
         plt.xscale("log")
+        # plt.yscale("log")
+        # plt.xscale("log")
         plt.title("Impact of KV-Projection before SSM", fontsize=24)
     if "expt_2" in file_name:
-        plt.title("Impact of SSM Size (Model Size: 60M)", fontsize=24)
-        plt.yscale("log")
-        plt.xscale("log")
+        plt.xlim(40000, 60000)
+        # Set upper ylim to 60 without setting lower limit
+        plt.ylim(34, 44)
+        # plt.yscale("log")
+        # plt.xscale("log")
+        # plt.yscale("log")
+        # plt.xscale("log")
+        plt.title("Impact of Increasing SSM State-Dimension", fontsize=24)
+        # plt.yscale("log")
+        # plt.xscale("log")
     if "expt_3" in file_name:
         plt.title("Impact of Chunking Boundary Strategy", fontsize=24)
         plt.yscale("log")
@@ -189,8 +206,9 @@ def plot_experiment(directory, experiment_names, file_name, experiment_group):
     if "expt_5" in file_name:
         plt.title("Impact of Pseudo-Chunking", fontsize=24)
         plt.xlim(10000)
-        # plt.ylim(25, 45)
-        plt.yscale("log")
+        # Set upper ylim to 60 without setting lower limit
+        plt.ylim(top=50)
+        # plt.yscale("log")
         plt.xscale("log")
     if "expt_6" in file_name:
         plt.title("Impact of leading-chunk preservation", fontsize=24)
