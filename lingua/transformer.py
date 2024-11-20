@@ -1692,6 +1692,32 @@ class AttentiveSSMNoProjFAttn(nn.Module):
             xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk, xv))
             xk_last = xk_processed[:, :, -1, :]
             xq_reshaped = xq.view(-1, xq.size(-2), xq.size(-1))
+            # xk_last_reshaped = xk_last.view(-1, xk_last.size(-1), 1)
+            # scores = torch.bmm(xq_reshaped, xk_last_reshaped).view(*xq.shape[:2], xq.size(-2), 1)
+            # # scores = torch.bmm(xq[:, 0, :, :], xk_processed[:, 0, -1, :].unsqueeze(1).transpose(1, 2))
+            # scores = scores / (xq.size(-1) ** 0.5)
+            # attn_weights = torch.softmax(scores.squeeze(), dim=-1)
+            # # self.topk_indices = torch.topk(attn_weights, int(0.1 * attn_weights.size(-1)), dim=-1)[1]
+            # # self.topk_indices = torch.topk(attn_weights, self.additional_tokens // attn_weights.size(1), dim=-1)[1].view(bsz, -1)
+            # # Take twice the number of tokens to increase chances of uniqueness
+            # extra_topk_indices = torch.topk(attn_weights, 2 * (seq_len // K) // attn_weights.size(1), dim=-1)[1]
+            # num_to_keep = self.additional_tokens if self.fattn_boundary == "uniform" else (seq_len // K)
+            # self.topk_indices = torch.empty(bsz, num_to_keep, dtype=torch.long, device=attn_weights.device)
+            # for i in range(bsz):
+            #     unique_tokens = torch.unique(extra_topk_indices[i]).tolist()  # Get unique tokens as a list
+            #     try:
+            #         self.topk_indices[i] = torch.tensor(unique_tokens[:num_to_keep], device=attn_weights.device)
+            #     except:
+            #         # take unique_toksn, and for rest use random numbers not in unique_tokens list, between min and max
+            #         min_tok = min(unique_tokens)
+            #         max_tok = max(unique_tokens)
+            #         remaining_tokens = num_to_keep - len(unique_tokens)
+            #         range_choices = set(list(range(min_tok, max_tok))) - set(unique_tokens)
+            #         random_tokens = torch.tensor(list(range_choices)[:remaining_tokens], device=attn_weights.device)
+            #         self.topk_indices[i] = torch.cat([torch.tensor(unique_tokens, device=attn_weights.device), random_tokens])
+            # del scores
+            # attn_mask = "causal"
+            # causality_mask = True
             xk_last_reshaped = xk_last.view(-1, xk_last.size(-1), 1)
             scores = torch.bmm(xq_reshaped, xk_last_reshaped).view(*xq.shape[:2], xq.size(-2), 1)
             scores = scores / (xq.size(-1) ** 0.5)

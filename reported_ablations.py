@@ -114,7 +114,7 @@ def get_label(experiment_name, experiment_group):
             "AttentiveSSMNoProjRand": "Random\u2006",
             "AttentiveSSMNoProjUnif": "Uniform\u00A0",
             "AttentiveSSMNoProjFSSM": "FSSM\u00A0\u2003\u00A0",
-            "AttentiveSSMNoProjFAttn": "FAttn\u00A0\u2003\u2002",
+            "AttentiveSSMNoProjFAttnv2": "FAttn\u00A0\u2003\u2002",
             "AttentiveSSMNoProjCyc": "Cyclic\u00A0\u2003",
         }
     elif experiment_group == 4:
