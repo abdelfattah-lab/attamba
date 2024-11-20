@@ -19,7 +19,7 @@ from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 
 from lingua.transformer import FeedForward, InitStdFactor, RMSNorm, RotaryEmbedding
 from lingua.probe import log_stats
-from lingua.transformer import AttentiveSSM, AttentiveSSMNoProjRand, AttentiveSSMNoProjFSSM, AttentiveSSMNoProjFAttn, AttentiveSSMNoProjCyc, AttentiveSSMWProjUnif, AttentiveSSMNoProjUnif
+from lingua.transformer import AttentiveSSMNoProjCyc
 
 from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
@@ -43,23 +43,40 @@ class InitArgs:
 @dataclass
 class BaseAttambaArgs:
 
+    # Important variables:
+    # token_chunk
+    # leading_tokens
+    # pseudo_chunk
+    # Hardcoded:
+    # residual_ssm: True
+    # keep_sink: False
+    # chunk_strat: "cyclic_pl"
+    # keep_wproj: false
+    # fattn_boundary: breakpoint
+    # additional_tokens: 0
+    
     dim: int = 512
     pseudo_chunk: bool = False
-    sep_ssm: bool = True # Deprecated, always True
-    keep_wproj: bool = True
+    leading_tokens: int = 1
+
     fattn_boundary: str = "uniform"
     ssm_hiddim: int = 512
     kvssm_dim: int = 32
     n_layers: int = 8
     n_heads: int = 8
     token_chunk: int = 32
-    leading_tokens: int = 1
-    kv_pressm: bool = False # Deprecated, always False
     n_kv_heads: Optional[int] = None
     head_dim: Optional[int] = None
-    keep_sink: bool = True
-    chunk_strat: str = "uniform"
+
+    # deprecated
+    sep_ssm: bool = True
+    kv_pressm: bool = False
+    keep_sink: bool = False
+    keep_wproj: bool = False
+    chunk_strat: str = "cyclic_pl"
     additional_tokens: int = 64
+
+
 
     norm_eps: float = 1e-5
 
@@ -452,25 +469,19 @@ class AttambaBlock(nn.Module):
         self.chunk_strat = args.chunk_strat
         self.keep_wproj = args.keep_wproj
 
-        if self.chunk_strat == "random":
-            AttentiveClass = AttentiveSSMNoProjRand
-        elif self.chunk_strat == "first_ssm":
-            AttentiveClass = AttentiveSSMNoProjFSSM
-        elif self.chunk_strat == "first_attention":
-            AttentiveClass = AttentiveSSMNoProjFAttn
-        elif self.chunk_strat == "cyclic_pl":
-            AttentiveClass = AttentiveSSMNoProjCyc
-        elif self.chunk_strat == "cyclic_pl_rand":
-            raise NotImplementedError("Cyclic PL with random chunking not working.")
-        elif self.chunk_strat == "uniform":
-            if self.keep_wproj:
-                AttentiveClass = AttentiveSSMWProjUnif
-            else:
-                AttentiveClass = AttentiveSSMNoProjUnif
-        else:
-            raise ValueError(f"Invalid strategy combination.")
- 
+        AttentiveClass = AttentiveSSMNoProjCyc
 
+        # Important variables:
+        # token_chunk
+        # leading_tokens
+        # pseudo_chunk
+        # Hardcoded:
+        # residual_ssm: True
+        # keep_sink: False
+        # chunk_strat: "cyclic_pl"
+        # keep_wproj: false
+        # fattn_boundary: breakpoint
+        # additional_tokens: 0
         self.attentive_ssm = AttentiveClass(
             dim=args.dim,
             head_dim=args.head_dim,
@@ -484,16 +495,16 @@ class AttambaBlock(nn.Module):
             v_ssmnorm=self.v_ssmnorm,
             kv_pressm=args.kv_pressm,
             chunk_size=args.ssm_chunk_size,
-            residual_ssm=args.residual_ssm,
+            residual_ssm=args.residual_ssm,             # deprecated
             pseudo_chunk=args.pseudo_chunk,
-            keep_sink=args.keep_sink,
-            chunk_strat=args.chunk_strat,
+            keep_sink=args.keep_sink,                   # deprecated
+            chunk_strat=args.chunk_strat,               # deprecated
             producer=producer,
-            additional_tokens=args.additional_tokens,
+            additional_tokens=args.additional_tokens,   # deprecated
             layer_idx=layer_idx,
             nlayers=args.n_layers,
-            keep_wproj=args.keep_wproj,
-            fattn_boundary=args.fattn_boundary,
+            keep_wproj=args.keep_wproj,                 # deprecated
+            fattn_boundary=args.fattn_boundary,         # deprecated
             leading_tokens=args.leading_tokens,
         )
         self.feed_forward = FeedForward(
