@@ -9,3 +9,7 @@ debug_d*
 finewebdata*
 *sample
 .git_backup
+*/profiling/*
+*/evals/*
+*/checkpoints/*
+ablation_backup*
