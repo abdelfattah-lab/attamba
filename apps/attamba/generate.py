@@ -18,7 +18,7 @@ from lingua.args import dataclass_from_dict
 from lingua.checkpoint import CONSOLIDATE_NAME
 from lingua.tokenizer import Tokenizer, build_tokenizer
 from lingua.transformer import (
-    AttentiveSSM,
+    AttentiveSSMNoProjCyc,
     causal_mask,
     generate_doc_mask_mod,
     lengths_to_local_ids,
@@ -203,7 +203,7 @@ class PackedCausalAttambaGenerator:
 
     def clear_cache(self, offset):
         for module in self.model.modules():
-            if isinstance(module, AttentiveSSM):
+            if isinstance(module, AttentiveSSMNoProjCyc):
                 if not hasattr(module, "kv_cache"):
                     module.kv_cache = KVCache(
                         1,
@@ -293,7 +293,7 @@ class PackedCausalAttambaGenerator:
     def setup_generation(self, lengths):
         # KV Cache offset is set to the start of the padded documents
         for module in self.model.modules():
-            if isinstance(module, AttentiveSSM):
+            if isinstance(module, AttentiveSSMNoProjCyc):
                 module.kv_cache.offset = self.padded_doc_start
         # The token ids during generations correspond to the lengths of each doc
         # current_tok_id will be incremented during generation

@@ -362,6 +362,9 @@ class AttentiveSSMNoProjCyc(nn.Module):
         self.rope_theta = rope_theta
         self.heads_per_group = self.n_heads // self.n_kv_heads
 
+        self.max_seq_len = 16384 # safe upper bound
+        self.precompute_boundaries()
+
         # Projection layers
         self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
@@ -403,74 +406,15 @@ class AttentiveSSMNoProjCyc(nn.Module):
         xq = self.wq(x)
         bsz, seq_len, edim = x.size()
 
-        xk = x
-        xv = x
-
-        
-        boundaries_list = list(range(K - 1, seq_len, K))
-        # increments of self.layer_idx * (token_chunk // self.n_layers)
-        boundary_offset = int(self.layer_idx * (self.token_chunk // self.nlayers))
-        # boundary_offset = int(layer_idx * (token_chunk // nlayers)) - 1
-        boundaries_list = [b - boundary_offset for b in boundaries_list]
-        if boundaries_list and boundaries_list[-1] != seq_len -1:
-            boundaries_list.append(seq_len -1)
-        if boundaries_list and boundaries_list[0] != 0:
-            boundaries_list.insert(0, 0)
-
-        boundaries_list = [boundaries_list for _ in range(bsz)]
-        boundaries_list = [bl for bl in boundaries_list]
-
-        total_boundaries = []
-        sequence_starts_list = []
-        sequence_lengths_list = []
-        for b in range(bsz):
-            boundaries_b = torch.tensor(boundaries_list[b], device=device)
-            batch_boundaries = boundaries_b + b * seq_len
-            total_boundaries.append(batch_boundaries)
-            if len(boundaries_b) == 0:
-                sequence_starts_b = torch.tensor([0], device=device)
-                sequence_lengths_b = torch.tensor([seq_len], device=device)
-            else:
-                sequence_starts_b = torch.cat([torch.tensor([0], device=device), boundaries_b[:-1] + 1])
-                sequence_lengths_b = boundaries_b - sequence_starts_b + 1
-            sequence_starts_b += b * seq_len
-            sequence_starts_list.append(sequence_starts_b)
-            sequence_lengths_list.append(sequence_lengths_b)
-        if len(total_boundaries) > 0:
-            total_boundaries = torch.cat(total_boundaries) 
-        else:
-            total_boundaries = torch.tensor([], device=device, dtype=torch.long)
-        if len(sequence_starts_list) > 0:
-            sequence_starts = torch.cat(sequence_starts_list)  # (total_sequences,)
-            sequence_lengths = torch.cat(sequence_lengths_list)  # (total_sequences,)
-        else:
-            sequence_starts = torch.tensor([], device=device, dtype=torch.long)
-            sequence_lengths = torch.tensor([], device=device, dtype=torch.long)
-
-        if total_boundaries.numel() > 0:
-            total_boundaries, _ = torch.sort(total_boundaries)
-
-        total_tokens = bsz * seq_len
-        positions = torch.arange(total_tokens, device=device)  # (total_tokens,)
-        sequence_ids = torch.bucketize(positions, total_boundaries)  # (total_tokens,)
-        if sequence_starts.numel() > 0:
-            sequence_starts_for_positions = sequence_starts[sequence_ids]  # (total_tokens,)
-            ssm_kv_tok_idx = positions - sequence_starts_for_positions  # (total_tokens,)
-        else:
-            ssm_kv_tok_idx = positions  # (total_tokens,)
-        cu_seqlens = torch.cat([
-            torch.tensor([0], device=device, dtype=torch.int32),
-            torch.cumsum(sequence_lengths, dim=0)
-        ])  # (total_sequences + 1,)
-        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)  # (1, total_tokens)
-
+        xk = x # No Key Projections
+        xv = x # No Value Projections
+        ssm_kv_tok_idx, cu_seqlens, boundaries = self.postcompute_boundaries(bsz, seq_len, dim, device, K)
         xk_processed = self.process_chunks_with_ssm(xk, self.k_ssm, ssm_kv_tok_idx, cu_seqlens)
         xv_processed = self.process_chunks_with_ssm(xv, self.v_ssm, ssm_kv_tok_idx, cu_seqlens)
 
         # always keep residual.
-        if self.residual_ssm:
-            xk_processed = xk_processed + xk
-            xv_processed = xv_processed + xv
+        xk_processed = xk_processed + xk
+        xv_processed = xv_processed + xv
 
         xq = xq.view(bsz, seq_len, n_heads,    head_dim)
         xk_processed = xk_processed.view(bsz, -1, n_kv_heads, head_dim)
@@ -490,9 +434,7 @@ class AttentiveSSMNoProjCyc(nn.Module):
             causality_mask = True
         else:
             is_chunk_boundary = torch.zeros(bsz, seq_len, dtype=torch.bool, device=device)
-            boundaries = torch.tensor(boundaries_list[0], device=device)  # uniform boundaries
-            is_chunk_boundary[:, boundaries.int()
-            ] = True
+            is_chunk_boundary[:, boundaries.int()] = True
             t_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(-1).expand(bsz, seq_len, 1)  # [B, L_q, 1]
             k_abs = torch.arange(seq_len, device=device).unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len)   # [B, 1, L_k]
             is_chunk_boundary_k = is_chunk_boundary.unsqueeze(1)  # [B, 1, L_k]
@@ -502,7 +444,6 @@ class AttentiveSSMNoProjCyc(nn.Module):
             attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
             attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
             causality_mask = False
-
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
 
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
@@ -522,6 +463,70 @@ class AttentiveSSMNoProjCyc(nn.Module):
         output = self.wo(output.view(bsz, seq_len, -1))  # [B, L_q, dim]
 
         return output
+
+    def update_tokchunk(self, new_K):
+        self.token_chunk = new_K
+        self.precompute_boundaries()
+        raise NotImplementedError("update_tokchunk not implemented for AttentiveSSMNoProjCyc")
+
+    def postcompute_boundaries(self, bsz, seq_len, dim, device, K):
+        # Adjust precomputed boundaries to actual sequence length
+        boundaries = self.precomputed_boundaries[self.precomputed_boundaries < seq_len].to(device)
+        boundaries[-1] = seq_len - 1 # Safe to always do this.
+
+        # Adjust sequence starts and lengths
+        sequence_starts = self.precomputed_sequence_starts[:boundaries.size(0)].to(device)
+        sequence_lengths = self.precomputed_sequence_lengths[:boundaries.size(0)].to(device)
+
+        # Broadcast to batch size
+        total_boundaries = boundaries.unsqueeze(0) + (seq_len * torch.arange(bsz, device=device).unsqueeze(1))
+        total_boundaries = total_boundaries.view(-1)
+        sequence_starts = sequence_starts.unsqueeze(0) + (seq_len * torch.arange(bsz, device=device).unsqueeze(1))
+        sequence_starts = sequence_starts.view(-1)
+        sequence_lengths = sequence_lengths.repeat(bsz)
+
+        # Compute positions and sequence IDs
+        total_tokens = bsz * seq_len
+        positions = torch.arange(total_tokens, device=device)
+        sequence_ids = torch.bucketize(positions, total_boundaries)
+        ssm_kv_tok_idx = positions - sequence_starts[sequence_ids]
+
+        # Compute cumulative sequence lengths
+        cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])
+        ssm_kv_tok_idx = ssm_kv_tok_idx.to(torch.int32).unsqueeze(0)
+
+        return ssm_kv_tok_idx, cu_seqlens, boundaries
+
+    def precompute_boundaries(self):
+        K = self.token_chunk
+        seq_len = self.max_seq_len
+        device = torch.device('cpu')  # Use CPU for precomputations to save GPU memory
+        boundaries_list = list(range(K - 1, seq_len, K))
+        boundary_offset = min(K-1, int(self.layer_idx * (self.token_chunk // self.nlayers))) # 7 * 8 // 8 = 7, K = 8; 7 - 7 == 0
+        boundaries_list = [b - boundary_offset for b in boundaries_list]
+        if boundaries_list and boundaries_list[-1] != seq_len -1:
+            boundaries_list.append(seq_len -1)
+        if boundaries_list and boundaries_list[0] != 0:
+            boundaries_list.insert(0, 0)
+        self.precomputed_boundaries = torch.tensor(boundaries_list, device=device)
+        if len(self.precomputed_boundaries) == 0:
+            sequence_starts = torch.tensor([0], device=device)
+            sequence_lengths = torch.tensor([seq_len], device=device)
+        else:
+            sequence_starts = torch.cat([
+                torch.tensor([0], device=device), 
+                self.precomputed_boundaries[:-1] + 1
+            ])
+            sequence_lengths = self.precomputed_boundaries - sequence_starts + 1
+        self.precomputed_sequence_starts = sequence_starts
+        self.precomputed_sequence_lengths = sequence_lengths
+        self.precomputed_cu_seqlens = torch.cat([
+            torch.tensor([0], device=device, dtype=torch.int32),
+            torch.cumsum(sequence_lengths, dim=0)
+        ])
 
     def reset_parameters(self, init_std=None, factor=1.0):
         init_std = init_std or (self.dim ** (-0.5))
