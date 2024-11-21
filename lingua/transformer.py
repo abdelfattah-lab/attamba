@@ -426,9 +426,6 @@ class AttentiveSSMNoProjCyc(nn.Module):
 
         L_k = xk_processed.size(1)
 
-        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
-        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
-
         if self.pseudo_chunk:
             attn_mask = "causal"
             causality_mask = True
@@ -444,6 +441,12 @@ class AttentiveSSMNoProjCyc(nn.Module):
             attn_mask = mask_condition.unsqueeze(1)  # [B, 1, L_q, L_k]
             attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
             causality_mask = False
+        
+        # fix xk_processed and xv_processed before KV repeat (MUCH faster, less memory)
+
+        xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+        xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
+
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
 
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
