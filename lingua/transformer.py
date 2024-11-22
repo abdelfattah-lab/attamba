@@ -31,6 +31,7 @@ class InitStdFactor(Enum):
 @dataclass
 class BaseTransformerArgs:
     dim: int = 512
+    attn_dim: int = 512 # Very customized, only reduces attention dimensions.
     n_layers: int = 8
     head_dim: Optional[int] = None
     n_heads: Optional[int] = None
@@ -442,8 +443,6 @@ class AttentiveSSMNoProjCyc(nn.Module):
             attn_mask = attn_mask.expand(-1, n_heads, -1, -1).contiguous()  # [B, H, L_q, L_k]
             causality_mask = False
         
-        # fix xk_processed and xv_processed before KV repeat (MUCH faster, less memory)
-
         xk_processed = repeat_kv(xk_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
         xv_processed = repeat_kv(xv_processed, self.heads_per_group, dim=2)  # [B, L, H_q, D]
 
@@ -451,6 +450,8 @@ class AttentiveSSMNoProjCyc(nn.Module):
 
         attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         try:
+            # ideally, this should be replaced by a custom implementation
+            # which utilizes our form of chunked attention
             output = F.scaled_dot_product_attention(
                 xq,
                 xk_processed,
@@ -551,11 +552,118 @@ class AttentiveSSMNoProjCyc(nn.Module):
             b=3 * init_std,
         )
 
+# class Attention(nn.Module):
+#     def __init__(
+#         self,
+#         dim: int,
+#         head_dim: int,
+#         n_heads: int,
+#         n_kv_heads: int,
+#         rope_theta: float,
+#     ):
+#         super().__init__()
+
+#         self.dim = dim
+#         self.head_dim = head_dim
+#         self.rope_theta = rope_theta
+
+#         self.n_heads = n_heads
+#         self.n_kv_heads = n_kv_heads
+#         self.heads_per_group = self.n_heads // self.n_kv_heads
+
+#         self.wq = nn.Linear(
+#             dim,
+#             n_heads * head_dim,
+#             bias=False,
+#         )
+#         self.wk = nn.Linear(
+#             dim,
+#             n_kv_heads * head_dim,
+#             bias=False,
+#         )
+#         self.wv = nn.Linear(
+#             dim,
+#             n_kv_heads * head_dim,
+#             bias=False,
+#         )
+
+#         self.wo = nn.Linear(
+#             n_heads * head_dim,
+#             dim,
+#             bias=False,
+#         )
+
+#     def forward(
+#         self,
+#         x: torch.Tensor,
+#         freq_cis: torch.Tensor,
+#         tok_idx: Optional[torch.Tensor] = None,
+#         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
+#         attn_impl: str = "sdpa",
+#     ) -> torch.Tensor:
+#         # B S D
+#         bsz, seq_len, dim = x.shape
+#         xq = self.wq(x.view_as(x))
+#         xk = self.wk(x.view_as(x))
+#         xv = self.wv(x.view_as(x))
+
+#         output_shape = xq.shape
+#         # B S D -> B S H D
+#         xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
+#         xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+#         xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+
+#         xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+
+#         # This condition helps us be easily compatible
+#         # with inference by adding a pluggable KVCache
+#         if hasattr(self, "kv_cache"):
+#             xk, xv = self.kv_cache.update(xk, xv, tok_idx)
+
+#         xk = repeat_kv(xk, self.heads_per_group, dim=2)
+#         xv = repeat_kv(xv, self.heads_per_group, dim=2)
+
+#         if attn_impl == "flex_attention":
+#             assert mask is None or isinstance(mask, BlockMask)
+#             xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+#             output = flex_attention_comp(xq, xk, xv, block_mask=mask)
+#             output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+
+#         elif attn_impl == "fmha":
+#             assert mask is None or isinstance(mask, AttentionBias)
+#             output = fmha.memory_efficient_attention(xq, xk, xv, attn_bias=mask)
+#             # This uses B S H D instead of B H S D of pytorch
+
+#         elif attn_impl == "sdpa":
+#             xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+#             assert mask is None or isinstance(mask, (str, torch.Tensor))
+#             # if mask is None or isinstance(mask, (str, torch.Tensor)):
+#             #     import pdb; pdb.set_trace()
+#             is_causal = (mask == "causal") if isinstance(mask, str) else False
+#             mask = mask if isinstance(mask, torch.Tensor) else None
+#             output = F.scaled_dot_product_attention(
+#                 xq,
+#                 xk,
+#                 xv,
+#                 is_causal=is_causal,
+#                 attn_mask=mask,
+#             )
+#             output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+#         else:
+#             raise NotImplementedError(
+#                 f"Attention implementation {attn_impl} not supported"
+#             )
+
+#         output = self.wo(output.reshape(output_shape))
+
+#         return output
+
 class Attention(nn.Module):
     def __init__(
         self,
         dim: int,
         head_dim: int,
+        attn_dim: int,
         n_heads: int,
         n_kv_heads: int,
         rope_theta: float,
@@ -564,6 +672,8 @@ class Attention(nn.Module):
 
         self.dim = dim
         self.head_dim = head_dim
+        if attn_dim != dim:
+            self.head_dim = attn_dim // n_heads
         self.rope_theta = rope_theta
 
         self.n_heads = n_heads
@@ -572,22 +682,22 @@ class Attention(nn.Module):
 
         self.wq = nn.Linear(
             dim,
-            n_heads * head_dim,
+            attn_dim,
             bias=False,
         )
         self.wk = nn.Linear(
             dim,
-            n_kv_heads * head_dim,
+            attn_dim,
             bias=False,
         )
         self.wv = nn.Linear(
             dim,
-            n_kv_heads * head_dim,
+            attn_dim,
             bias=False,
         )
 
         self.wo = nn.Linear(
-            n_heads * head_dim,
+            attn_dim,
             dim,
             bias=False,
         )
@@ -621,37 +731,50 @@ class Attention(nn.Module):
 
         xk = repeat_kv(xk, self.heads_per_group, dim=2)
         xv = repeat_kv(xv, self.heads_per_group, dim=2)
+        xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+        # Hardcode mask to remove flex-attention non-compatibility with non-power of 2
+        attn_mask = "causal"
+        causality_mask = True
+        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        output = F.scaled_dot_product_attention(
+            xq,
+            xk,
+            xv,
+            attn_mask=attn_mask,
+            is_causal=causality_mask
+        )
+        output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
 
-        if attn_impl == "flex_attention":
-            assert mask is None or isinstance(mask, BlockMask)
-            xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
-            output = flex_attention_comp(xq, xk, xv, block_mask=mask)
-            output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        # if attn_impl == "flex_attention":
+        #     assert mask is None or isinstance(mask, BlockMask)
+        #     xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+        #     output = flex_attention_comp(xq, xk, xv, block_mask=mask)
+        #     output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
 
-        elif attn_impl == "fmha":
-            assert mask is None or isinstance(mask, AttentionBias)
-            output = fmha.memory_efficient_attention(xq, xk, xv, attn_bias=mask)
-            # This uses B S H D instead of B H S D of pytorch
+        # elif attn_impl == "fmha":
+        #     assert mask is None or isinstance(mask, AttentionBias)
+        #     output = fmha.memory_efficient_attention(xq, xk, xv, attn_bias=mask)
+        #     # This uses B S H D instead of B H S D of pytorch
 
-        elif attn_impl == "sdpa":
-            xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
-            assert mask is None or isinstance(mask, (str, torch.Tensor))
-            # if mask is None or isinstance(mask, (str, torch.Tensor)):
-            #     import pdb; pdb.set_trace()
-            is_causal = (mask == "causal") if isinstance(mask, str) else False
-            mask = mask if isinstance(mask, torch.Tensor) else None
-            output = F.scaled_dot_product_attention(
-                xq,
-                xk,
-                xv,
-                is_causal=is_causal,
-                attn_mask=mask,
-            )
-            output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
-        else:
-            raise NotImplementedError(
-                f"Attention implementation {attn_impl} not supported"
-            )
+        # elif attn_impl == "sdpa":
+        #     xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
+        #     assert mask is None or isinstance(mask, (str, torch.Tensor))
+        #     # if mask is None or isinstance(mask, (str, torch.Tensor)):
+        #     #     import pdb; pdb.set_trace()
+        #     is_causal = (mask == "causal") if isinstance(mask, str) else False
+        #     mask = mask if isinstance(mask, torch.Tensor) else None
+        #     output = F.scaled_dot_product_attention(
+        #         xq,
+        #         xk,
+        #         xv,
+        #         is_causal=is_causal,
+        #         attn_mask=mask,
+        #     )
+        #     output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        # else:
+        #     raise NotImplementedError(
+        #         f"Attention implementation {attn_impl} not supported"
+        #     )
 
         output = self.wo(output.reshape(output_shape))
 
@@ -752,6 +875,7 @@ class TransformerBlock(nn.Module):
         self.head_dim = args.head_dim or args.dim // args.n_heads
         self.n_heads = args.n_heads or args.dim // args.head_dim
         self.n_kv_heads = args.n_kv_heads or self.n_heads
+        self.attn_dim = args.attn_dim
 
         assert args.n_heads % self.n_kv_heads == 0
         assert args.dim % args.n_heads == 0
@@ -759,6 +883,7 @@ class TransformerBlock(nn.Module):
         self.attention = Attention(
             dim=args.dim,
             head_dim=self.head_dim,
+            attn_dim=self.attn_dim,
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             rope_theta=args.rope_theta,
@@ -806,9 +931,12 @@ class BaseTransformer(nn.Module):
         self.init_base_std = args.init_base_std
         self.init_std_factor = InitStdFactor(args.init_std_factor)
         self.max_seqlen = args.max_seqlen
+        head_dim = args.head_dim or args.dim // args.n_heads
+        if args.attn_dim:
+            head_dim = args.attn_dim // args.n_heads
         self.rope_embeddings = RotaryEmbedding(
             theta=args.rope_theta,
-            head_dim=args.head_dim or args.dim // args.n_heads,
+            head_dim=head_dim,
             max_seqlen=args.max_seqlen,
         )
 
