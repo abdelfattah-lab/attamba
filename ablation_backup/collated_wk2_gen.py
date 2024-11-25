@@ -92,8 +92,8 @@ def plot_results(directory, selected_experiments=None):
     print(experiments)
 
     plt.figure(figsize=(16, 6))
-    # plt.figure(figsize=(18, 6))
-    plt.title("Transformer, Mamba, minGRU, Hawk, Attamba", fontsize=24)
+    # # plt.figure(figsize=(18, 6))
+    # plt.title("Transformer, Mamba, minGRU, Hawk, Attamba", fontsize=24)
     plt.xlabel("Global Step", fontsize=24)
     plt.ylabel("WK2 Perplexity", fontsize=24)
     plt.grid(visible=True, linestyle="--", alpha=0.5)

@@ -99,7 +99,7 @@ def plot_bar_chart(directory):
         plt.cm.Blues(0.7),       # Medium blue
         plt.cm.Blues(0.9)        # Darker blue
     ]
-    line_color = plt.cm.Blues(0.3)
+    line_color = plt.cm.Black(0.9)
 
     # get a new color, as green
     x_positions = []
