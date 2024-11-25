@@ -1,12 +1,20 @@
-name: "debug_evals"
-# ckpt_dir: !!CHANGETHIS!!
-# dataset_dir: !!CHANGETHIS!!
-# dump_dir: !!CHANGETHIS!!
-tasks: boolq,hellaswag,nq,piqa,siqa,tqa,winogrande,obqa,arc_easy,arc_challenge,race.middle,race.high,gsm8k,bbh,mmlu,copa,human_eval_plus,mbpp
+name: "long_isoxmer"
+ckpt_dir: /scratch/ya255/lingua/ablation_backup/long_runs/mamba_long/checkpoints
+dump_dir: /scratch/ya255/lingua/fulleval/mamba
+
+tasks:
+  - wikitext
+  - hellaswag
+  - piqa
+  - winogrande
+  - arc_easy
+  - arc_challenge
+  - gsm8k
+  - mmlu
 generator:
   compile_prefilling: false
   reduce_generation_overhead: false
-  max_tokens: 8192
+  max_tokens: 1024
   dtype: bf16
 
 mp_size: 1

@@ -1,0 +1,17 @@
+name: "eval_isoatt4"
+ckpt_dir: /scratch/ya255/lingua/ablation_backup/long_runs/AttentiveSSMNoProjCyc4L32_Long/checkpoints/0000100000
+dump_dir: /scratch/ya255/lingua/fulleval/attamba
+generator:
+  max_tokens: 1024
+  dtype: bf16
+  temperature: 0.0
+  # top_p: 0.95
+harness:
+  limit: 1000
+  tasks:
+    - wikitext
+    # - gsm8k
+    # - lambada
+    # - squad_completion
+    # - lambada_cloze
+    # - triviaqa

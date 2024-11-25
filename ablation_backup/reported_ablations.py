@@ -58,6 +58,7 @@ def plot_experiment_group_7(directory, experiment_names, file_name):
     for label in layer_sizes:
         # ensure it is sorted by 'L'
         layer_sizes[label], perplexities[label] = zip(*sorted(zip(layer_sizes[label], perplexities[label])))
+        print(label, layer_sizes[label], perplexities[label])
         plt.plot(layer_sizes[label], perplexities[label], label=label, marker="o", markersize=12, linestyle="-")
 
     # Add the Transformer baseline as a horizontal dotted line

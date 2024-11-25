@@ -1,11 +1,17 @@
-name: "debug_evals"
-ckpt_dir: /scratch/ya255/lingua/final_runs/xmer_100k/checkpoints/0000100000
-dump_dir: /scratch/ya255/lingua/evaldump
+name: "long_isoxmer"
+ckpt_dir: /scratch/ya255/lingua/ablation_backup/long_runs/isoxmer_long/checkpoints/0000095000
+dump_dir: /scratch/ya255/lingua/fulleval/xmer
 generator:
   max_tokens: 1024
   dtype: bf16
-  temperature: 1.0
-  top_p: 0.95
+  temperature: 0.0
+  # top_p: 0.95
 harness:
+  limit: 1000
   tasks:
     - wikitext
+    - gsm8k
+    - lambada
+    - squad_completion
+    - lambada_cloze
+    - triviaqa
