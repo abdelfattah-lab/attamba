@@ -131,7 +131,7 @@ def plot_results(directory, selected_experiments=None):
                  color=colors[marker_index % num_combinations], markersize=16, marker=markers[marker_index % len(markers)])
         marker_index += 1  # Increment marker index
 
-    legend = plt.legend(title = "\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0E\u00A0\u00A0\u00A0 C \u00A0\u00A0\u00A0L \u00A0\u00A0\u00A0\u00A0\u00A0\u00A0Ds \u00A0\u00A0\u00A0G \u00A0\u00A0\u00A0H\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u2003\u2002\u2009\u200A", \
+    legend = plt.legend(title = "\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0E\u00A0\u00A0\u00A0 P \u00A0\u00A0\u00A0L \u00A0\u00A0\u00A0\u00A0\u00A0\u00A0Ds \u00A0\u00A0\u00A0G \u00A0\u00A0\u00A0H\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u00A0\u2003\u2002\u2009\u200A", \
                         title_fontsize=20, fontsize=20, ncol=1, loc="lower left")
 
     # for text in legend.get_texts():

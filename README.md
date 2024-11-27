@@ -1,9 +1,8 @@
 # Attamba
 
 
-<p align="center">  
- <img src="Attamba_Test_Train.pdf" width="100%"/>
-</p>
+![alt text](Attamba_Test_Train.png)
+
 
 ## Code release in progress.
 
