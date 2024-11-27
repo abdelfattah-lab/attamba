@@ -33,7 +33,7 @@ All of our runs are stored in `ablation_backup`
 
 <!-- <img src="https://arxiv.org/html/2411.17685v1/x6.png" alt="Refer to caption"/> -->
 **Figure**: Reproduce by running `python collated_wk2_gen.py  long_runs`
-![alt text](image.png)
+![alt text](long_run_results.png)
 
 
 ## Acknowledgement
