@@ -1,0 +1,128 @@
+name: isoFLOP160
+dump_dir: /scratch/ya255/lingua/comparative_runs/isoFLOP160
+seed: 777
+grad_acc_steps: 1
+gc_collect_freq: 1000
+probe_freq: null
+steps: 60000
+data:
+  root_dir: /scratch/ya255/lingua/setup/data/
+  sources:
+    dclm_baseline_1.0_shuffled: 100.0
+  batch_size: 16
+  seq_len: 1024
+  n_views: 2
+  seed: 42
+  add_bos: true
+  add_eos: true
+  load_async: true
+  prefetch_size: 512
+  tokenizer:
+    name: sp
+    path: setup/l2tokenizer/tokenizer.model
+optim:
+  lr: 0.003
+  weight_decay: 0.033
+  epsilon: 1.0e-08
+  beta1: 0.9
+  beta2: 0.95
+  clip: 1.0
+  scheduler: cosine
+  warmup: 5000
+  lr_min_ratio: 1.0e-06
+  cycle_length: 1.0
+  cosine_theta: 1.0
+  annealing_step: 1000
+  exp_factor: 0.5
+model:
+  dim: 512
+  attn_dim: 160
+  n_layers: 8
+  head_dim: null
+  n_heads: 8
+  n_kv_heads: null
+  ffn_dim_multiplier: null
+  multiple_of: 256
+  norm_eps: 1.0e-05
+  rope_theta: 10000.0
+  init_base_std: null
+  init_std_factor: disabled
+  max_seqlen: 1024
+  seed: 42
+  vocab_size: 32000
+  weight_tying: false
+  sliding_window: null
+distributed:
+  dp_shard: 1
+  dp_replicate: 1
+  tp_size: 1
+  selective_activation_checkpointing: false
+  compile: false
+  fsdp_type: full_shard
+  model_dtype: bf16
+  float8_recipe: null
+  float8_filter: layers\.[0-9]+\.
+  matmul_allow_tf32: false
+  detect_anomaly: false
+  compile_cache_size_limit: 8
+  spawn_method: forkserver
+env:
+  MKL_SERVICE_FORCE_INTEL: GNU
+  OMP_NUM_THREADS: '1'
+  MKL_NUM_THREADS: '1'
+  ENABLE_INTRA_NODE_COMM: '1'
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '1'
+  NCCL_IB_TIMEOUT: '22'
+  NCCL_DEBUG: INFO
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: '1'
+checkpoint:
+  dump:
+    every: 10000
+    keep: 3
+  eval:
+    every: 5000
+    keep: -1
+  path: /scratch/ya255/lingua/comparative_runs/isoFLOP160/checkpoints
+  init_ckpt_path: null
+  continue_training_from_init: false
+profiling:
+  run: true
+  trace_folder: profiling
+  mem_warmup: 0
+  mem_steps: 4
+  profile_warmup: 100
+  profile_steps: 4
+logging:
+  freq: 10
+  acc_freq: null
+  wandb:
+    job_type: null
+    dir: null
+    project: attamba_isoStudy
+    entity: null
+    tags: null
+    group: null
+    name: isoFLOP160
+    notes: null
+    config_exclude_keys: null
+    config_include_keys: null
+    anonymous: null
+    mode: null
+    allow_val_change: null
+    resume: null
+    force: null
+    tensorboard: null
+    sync_tensorboard: null
+    monitor_gym: null
+    save_code: null
+    id: null
+    fork_from: null
+    resume_from: null
+async_eval_gpus: null
+eval:
+  generator:
+    max_tokens: 1024
+    dtype: bf16
+  harness:
+    tasks:
+    - wikitext
