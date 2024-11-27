@@ -1,4 +1,10 @@
 # Attamba
+
+
+<p align="center">  
+ <img src="Attamba_Test_Train.pdf" width="100%"/>
+</p>
+
 ## Code release in progress.
 
 
