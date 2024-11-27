@@ -46,3 +46,19 @@ All of our runs are stored in `ablation_backup`
   year = {2024}
 }
 ```
+
+## Citing
+
+If you use Attamba in your research, please cite our paper:
+
+```
+@misc{akhauri2024attambaattendingmultitokenstates,
+      title={Attamba: Attending To Multi-Token States}, 
+      author={Yash Akhauri and Safeen Huda and Mohamed S. Abdelfattah},
+      year={2024},
+      eprint={2411.17685},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2411.17685}, 
+}
+```
