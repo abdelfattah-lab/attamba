@@ -448,21 +448,21 @@ class AttentiveSSMNoProjCyc(nn.Module):
 
         xq, xk_processed, xv_processed = map(lambda e: e.transpose(1, 2).contiguous(), (xq, xk_processed, xv_processed))
 
-        attn_weights = torch.einsum("bhqd,bhkd->bhqk", xq, xk_processed)
-        attn_weights = attn_weights / (head_dim ** 0.5)
-        attn_weights = attn_weights.masked_fill(attn_mask.logical_not(), float("-inf"))
+        # attn_weights = torch.einsum("bhqd,bhkd->bhqk", xq, xk_processed)
+        # attn_weights = attn_weights / (head_dim ** 0.5)
+        # attn_weights = attn_weights.masked_fill(attn_mask.logical_not(), float("-inf"))
         
-        import matplotlib.pyplot as plt
-        attn_probs = F.softmax(attn_weights[:, :, :, :], dim=-1)
-        heatmap_tensor = 2*attn_probs[0, 0, :, :].cpu().detach().float()
-        random_values = torch.empty_like(heatmap_tensor).uniform_(0.8, 1.0) 
-        heatmap_tensor[heatmap_tensor > 0] = random_values[heatmap_tensor > 0]
-        plt.figure(figsize=(10, 10))
-        plt.imshow(heatmap_tensor, cmap="viridis", aspect="auto")
-        plt.savefig("./attn_mask.png", dpi=500)
-        attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
+        # import matplotlib.pyplot as plt
+        # attn_probs = F.softmax(attn_weights[:, :, :, :], dim=-1)
+        # heatmap_tensor = 2*attn_probs[0, 0, :, :].cpu().detach().float()
+        # random_values = torch.empty_like(heatmap_tensor).uniform_(0.8, 1.0) 
+        # heatmap_tensor[heatmap_tensor > 0] = random_values[heatmap_tensor > 0]
+        # plt.figure(figsize=(10, 10))
+        # plt.imshow(heatmap_tensor, cmap="viridis", aspect="auto")
+        # plt.savefig("./attn_mask.png", dpi=500)
+        # attn_mask = attn_mask if isinstance(attn_mask, torch.Tensor) else None
         
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         try:
             # ideally, this should be replaced by a custom implementation
             # which utilizes our form of chunked attention
